@@ -15,31 +15,36 @@ import argparse
 import json
 from pathlib import Path
 
+import re
+import sys
 import logging
+import warnings
 
 import numpy as np
 import torch
 from diffusers import StableDiffusion3Pipeline
 from tqdm import tqdm
 
-import warnings
+# The CLIP tokenizer writes its truncation warning directly to stderr,
+# bypassing both the logging system and warnings.warn(). Wrap stderr so
+# any write containing the pattern is silently dropped.
+class _SuppressTruncationStderr:
+    _pat = re.compile(r"truncated because")
 
-# Suppress CLIP's per-sample truncation warnings (expected for long captions).
-# Filters on a parent logger don't apply to records propagated from child loggers,
-# so we must target the exact loggers that emit the warning.
-class _DropTruncationWarnings(logging.Filter):
-    def filter(self, record):
-        return "truncated because" not in record.getMessage()
+    def __init__(self, real):
+        self._real = real
 
-_f = _DropTruncationWarnings()
-for _name in (
-    "transformers.models.clip.tokenization_clip",
-    "transformers.models.clip.tokenization_clip_fast",
-):
-    logging.getLogger(_name).addFilter(_f)
+    def write(self, msg):
+        if not self._pat.search(msg):
+            self._real.write(msg)
 
-# Cover any warnings.warn() path as well
-warnings.filterwarnings("ignore", message=".*truncated.*")
+    def flush(self):
+        self._real.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+sys.stderr = _SuppressTruncationStderr(sys.stderr)
 
 
 def parse_args():
@@ -50,7 +55,7 @@ def parse_args():
                    help="Local path to caption shards (from download_data.py --captions)")
     p.add_argument("--output_dir", required=True,
                    help="Where to write embedding .npz shards")
-    p.add_argument("--shard_size", type=int, default=10_000,
+    p.add_argument("--shard_size", type=int, default=1_000,
                    help="Embeddings per output shard")
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--device", default="cuda")
@@ -127,8 +132,8 @@ def main():
     def flush_shard():
         nonlocal shard_idx
         name = f"shard_{shard_idx:05d}"
-        enc_arr = np.stack(enc_hs_buf).astype(np.float16)
-        pooled_arr = np.stack(pooled_buf).astype(np.float16)
+        enc_arr = np.stack(enc_hs_buf)   # already float16
+        pooled_arr = np.stack(pooled_buf)
 
         # Write to temp files first, then rename atomically
         enc_tmp = enc_dir / f"{name}.tmp.npy"
@@ -150,8 +155,8 @@ def main():
             prompt_2=captions,
             prompt_3=captions,
         )
-        enc_hs_buf.extend(prompt_embeds.cpu().float().numpy())
-        pooled_buf.extend(pooled_embeds.cpu().float().numpy())
+        enc_hs_buf.extend(prompt_embeds.cpu().half().numpy())
+        pooled_buf.extend(pooled_embeds.cpu().half().numpy())
 
     pbar = tqdm(caption_iter, desc="Computing embeddings", total=total_captions, initial=total)
     for caption in pbar:

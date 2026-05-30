@@ -41,22 +41,23 @@ The complete offline workflow is now:
   On the frontend (internet-connected):
   # 1. Download captions (text only, fast)
   python download_data.py --captions \
-      --dataset_name laion/laion-aesthetics-v2-5plus \
+      --dataset_name data-archetype/LAION_Aesthetics_1024_bucketed_1024 \
       --caption_column TEXT \
       --max_samples 5000000 \
-      --captions_dir /shared/captions
+      --captions_dir ./shared/captions
 
   # 2. Download model weights (transformer + text encoders, no VAE)
   python download_data.py --model \
       --model_id stabilityai/stable-diffusion-3.5-medium \
-      --model_dir /shared/models/sd3.5-medium
+      --model_dir ./shared/models/sd3.5-medium
 
   On compute nodes (no internet):
   # 3. Precompute embeddings (needs text encoders + captions)
   python precompute_embeddings.py \
-      --model_dir /shared/models/sd3.5-medium \
-      --captions_dir /shared/captions \
-      --output_dir /shared/embeddings 
+      --model_dir ./shared/models/sd3.5-medium \
+      --captions_dir ./shared/captions \
+      --output_dir ./shared/embeddings \
+      --batch_size 250
    
   # 4. Train (needs transformer weights + embeddings)
   sbatch launch_slurm.sh   # points to /shared/models/sd3.5-medium
