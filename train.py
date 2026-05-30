@@ -44,7 +44,7 @@ def parse_args():
     p.add_argument("--pom_degree", type=int, default=4)
     p.add_argument("--pom_expand", type=int, default=2)
     p.add_argument("--pom_n_groups", type=int, default=1)
-    p.add_argument("--pom_n_sel_heads", type=int, default=1)
+    p.add_argument("--pom_n_sel_heads", type=int, default=24)
 
     # Training
     p.add_argument("--batch_size", type=int, default=4, help="Per-GPU batch size")
