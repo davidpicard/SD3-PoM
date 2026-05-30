@@ -19,7 +19,6 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
 import wandb
@@ -103,35 +102,47 @@ def lr_schedule(step: int, warmup_steps: int, max_steps: int, base_lr: float) ->
 # Distillation loss
 # ---------------------------------------------------------------------------
 
-def distillation_loss(
-    student_out: torch.Tensor,
-    teacher_out: torch.Tensor,
-    student_intermediates: list[tuple],
-    teacher_intermediates: list[tuple],
-    block_weight: float,
-) -> dict[str, torch.Tensor]:
-    """MSE + MAE between student and teacher at each block and at final output."""
-    def mse_mae(a, b):
-        return F.mse_loss(a, b) + F.l1_loss(a, b)
+def _mse_mae(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return F.mse_loss(a, b) + F.l1_loss(a, b)
 
-    def mse_mae_block(a, b):
-        # Normalise by teacher's activation std so block_loss ≈ O(1) per
-        # comparison regardless of activation magnitude.  Without this, PoM's
-        # near-zero initialisation causes compounding divergence over 24 layers
-        # that pushes block_loss to O(10⁶), drowning final_loss gradients.
-        scale = b.detach().std().clamp(min=1e-8)
-        return F.mse_loss(a / scale, b / scale) + F.l1_loss(a / scale, b / scale)
 
-    final_loss = mse_mae(student_out, teacher_out)
+def _mse_mae_block(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    scale = b.detach().std().clamp(min=1e-8)
+    return F.mse_loss(a / scale, b / scale) + F.l1_loss(a / scale, b / scale)
 
-    block_loss = torch.tensor(0.0, device=student_out.device)
-    for (s_enc, s_img), (t_enc, t_img) in zip(student_intermediates, teacher_intermediates):
-        block_loss = block_loss + mse_mae_block(s_img, t_img)
-        if s_enc is not None and t_enc is not None:
-            block_loss = block_loss + mse_mae_block(s_enc, t_enc)
 
-    total = final_loss + block_weight * block_loss
-    return {"loss": total, "final_loss": final_loss.detach(), "block_loss": block_loss.detach()}
+def teacher_forced_block_loss(
+    raw_student,
+    teacher_attn_data: list[dict],
+    device: torch.device,
+) -> torch.Tensor:
+    """Compute block loss by running each student PoM on teacher's normalised states.
+
+    For each block the teacher hook captures the normalised inputs that went into
+    the teacher's attention module and the attention outputs.  We feed those same
+    inputs through the student's PoM and compare the outputs directly.  This
+    eliminates compounding: each block's PoM gets a clean, independent gradient
+    signal with no dependency on how well earlier blocks are doing.
+    """
+    block_loss = torch.tensor(0.0, device=device)
+    for s_blk, cap in zip(raw_student.transformer_blocks, teacher_attn_data):
+        norm_img = cap.get('norm_img')
+        if norm_img is None:
+            continue
+        norm_text = cap.get('norm_text')
+        n_img = norm_img.shape[1]
+        joint = torch.cat([norm_img, norm_text], dim=1) if norm_text is not None else norm_img
+
+        pom_out = s_blk.pom(joint)
+        block_loss = block_loss + _mse_mae_block(pom_out[:, :n_img], cap['attn_img'])
+        if norm_text is not None and 'attn_text' in cap:
+            block_loss = block_loss + _mse_mae_block(pom_out[:, n_img:], cap['attn_text'])
+
+        if s_blk.pom2 is not None and 'norm_img2' in cap:
+            pom2_out = s_blk.pom2(cap['norm_img2'])
+            block_loss = block_loss + _mse_mae_block(pom2_out, cap['attn2_img'])
+
+    return block_loss
 
 
 # ---------------------------------------------------------------------------
@@ -325,10 +336,7 @@ def main():
         ).to(device=device, dtype=torch.bfloat16)
 
     student.train()
-    if dist.is_initialized():
-        student = DDP(student, device_ids=[local_rank], find_unused_parameters=False)
-
-    raw_student = student.module if isinstance(student, DDP) else student
+    raw_student = student
 
     # --- Freeze everything except PoM layers ---
     pom_fragments = (".pom.", ".pom2.")
@@ -373,71 +381,86 @@ def main():
             pooled = batch["pooled_projections"].to(device=device, dtype=torch.bfloat16)
             timestep = batch["timestep"].to(device=device)
 
-            # --- Teacher forward (no grad) ---
+            # --- Teacher forward (no grad): capture attn inputs + outputs per block ---
             if teacher is not None:
+                teacher_attn_data = [{} for _ in range(len(teacher.transformer_blocks))]
+                teacher_hooks = []
+
+                for _i, _blk in enumerate(teacher.transformer_blocks):
+                    _cap = teacher_attn_data[_i]
+
+                    def _make_pre(_c):
+                        def _hook(_m, _args, _kwargs):
+                            _c['norm_img'] = _kwargs.get('hidden_states')
+                            _c['norm_text'] = _kwargs.get('encoder_hidden_states')
+                        return _hook
+
+                    def _make_post(_c):
+                        def _hook(_m, _inp, _out):
+                            _c['attn_img'] = _out[0].detach()
+                            if isinstance(_out, tuple) and len(_out) > 1 and _out[1] is not None:
+                                _c['attn_text'] = _out[1].detach()
+                        return _hook
+
+                    teacher_hooks.append(_blk.attn.register_forward_pre_hook(_make_pre(_cap), with_kwargs=True))
+                    teacher_hooks.append(_blk.attn.register_forward_hook(_make_post(_cap)))
+
+                    if hasattr(_blk, 'attn2') and _blk.attn2 is not None:
+                        def _make_pre2(_c):
+                            def _hook(_m, _args, _kwargs):
+                                _c['norm_img2'] = _kwargs.get('hidden_states')
+                            return _hook
+
+                        def _make_post2(_c):
+                            def _hook(_m, _inp, _out):
+                                _c['attn2_img'] = (_out[0] if isinstance(_out, tuple) else _out).detach()
+                            return _hook
+
+                        teacher_hooks.append(_blk.attn2.register_forward_pre_hook(_make_pre2(_cap), with_kwargs=True))
+                        teacher_hooks.append(_blk.attn2.register_forward_hook(_make_post2(_cap)))
+
                 with torch.no_grad():
-                    teacher_intermediates = []
-                    teacher_hooks = []
-
-                    def _make_teacher_hook(lst):
-                        def hook(m, inp, out):
-                            lst.append((
-                                out[0].detach() if out[0] is not None else None,
-                                out[1].detach(),
-                            ))
-                        return hook
-
-                    for blk in teacher.transformer_blocks:
-                        teacher_hooks.append(blk.register_forward_hook(_make_teacher_hook(teacher_intermediates)))
-
-                    teacher_out_dict = teacher(
+                    teacher_out = teacher(
                         hidden_states=hidden_states,
                         encoder_hidden_states=enc_hs,
                         pooled_projections=pooled,
                         timestep=timestep,
-                    )
-                    teacher_out = teacher_out_dict.sample.detach()
+                    ).sample.detach()
 
-                    for h in teacher_hooks:
-                        h.remove()
+                for _h in teacher_hooks:
+                    _h.remove()
             else:
-                # Smoke test: use random targets
+                # Smoke test: no teacher, skip block loss
                 teacher_out = torch.randn_like(hidden_states)
-                n_tokens = (32 * 32) // (2 * 2)  # patch_size=2
-                teacher_intermediates = [
-                    (None, torch.randn(hidden_states.shape[0], n_tokens, 64, device=device, dtype=torch.bfloat16))
-                    for _ in range(2)
-                ]
+                teacher_attn_data = []
 
-            # --- Student forward ---
-            student_out_dict, student_intermediates = raw_student(
+            # --- Block loss: student PoM on teacher's normalised states (with grad) ---
+            block_loss = (
+                teacher_forced_block_loss(raw_student, teacher_attn_data, device)
+                if teacher_attn_data else torch.tensor(0.0, device=device)
+            )
+
+            # --- Student forward for final loss ---
+            student_out = raw_student(
                 hidden_states=hidden_states,
                 encoder_hidden_states=enc_hs,
                 pooled_projections=pooled,
                 timestep=timestep,
-                return_intermediate=True,
-            ) if not isinstance(student, DDP) else student.module(
-                hidden_states=hidden_states,
-                encoder_hidden_states=enc_hs,
-                pooled_projections=pooled,
-                timestep=timestep,
-                return_intermediate=True,
-            )
-            student_out = student_out_dict.sample
+            ).sample
 
-            # --- Loss ---
-            losses = distillation_loss(
-                student_out,
-                teacher_out,
-                student_intermediates,
-                teacher_intermediates,
-                block_weight=args.block_loss_weight,
-            )
-            loss = losses["loss"] / args.grad_accum_steps
-            loss.backward()
+            # --- Combined loss ---
+            final_loss = _mse_mae(student_out, teacher_out)
+            total_loss = final_loss + args.block_loss_weight * block_loss
+            (total_loss / args.grad_accum_steps).backward()
 
             if (step + 1) % args.grad_accum_steps == 0:
-                torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
+                if dist.is_initialized():
+                    world_size = dist.get_world_size()
+                    for _p in pom_params:
+                        if _p.grad is not None:
+                            dist.all_reduce(_p.grad, op=dist.ReduceOp.SUM)
+                            _p.grad.div_(world_size)
+                torch.nn.utils.clip_grad_norm_(pom_params, 1.0)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
@@ -445,9 +468,9 @@ def main():
             if is_main() and step % args.log_every == 0:
                 elapsed = time.time() - t0
                 log = {
-                    "loss": losses["loss"].item(),
-                    "final_loss": losses["final_loss"].item(),
-                    "block_loss": losses["block_loss"].item(),
+                    "loss": total_loss.item(),
+                    "final_loss": final_loss.item(),
+                    "block_loss": block_loss.item(),
                     "lr": lr,
                     "step": step,
                     "samples_per_sec": (step + 1) * args.batch_size * (dist.get_world_size() if dist.is_initialized() else 1) / elapsed,
