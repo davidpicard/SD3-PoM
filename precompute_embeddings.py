@@ -109,7 +109,7 @@ def main():
             encoder_hidden_states=np.stack(enc_hs_buf).astype(np.float16),
             pooled_projections=np.stack(pooled_buf).astype(np.float16),
         )
-        tmp.rename(path)
+        tmp.with_suffix(".npz").rename(path)
         # Update index immediately after the rename so resuming is always consistent
         index[name] = len(enc_hs_buf)
         index_path.write_text(json.dumps(index, indent=2))
