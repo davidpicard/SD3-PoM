@@ -1,4 +1,5 @@
 """PoM-based transformer blocks that mirror SD3.5's JointTransformerBlock API."""
+import math
 from typing import Any
 
 import torch
@@ -43,6 +44,7 @@ class JointPoMBlock(nn.Module):
         pom_expand: int = 2,
         pom_n_groups: int = 1,
         pom_n_sel_heads: int = 1,
+        lora_rank: int = 0,
     ):
         super().__init__()
         self.use_dual_attention = use_dual_attention
@@ -92,6 +94,24 @@ class JointPoMBlock(nn.Module):
         else:
             self.norm2_context = None
             self.ff_context = None
+
+        # --- LoRA on FF layers (trained alongside PoM to absorb approximation error) ---
+        if lora_rank > 0:
+            self.ff_lora_A = nn.Linear(dim, lora_rank, bias=False)
+            self.ff_lora_B = nn.Linear(lora_rank, dim, bias=False)
+            nn.init.kaiming_uniform_(self.ff_lora_A.weight, a=math.sqrt(5))
+            nn.init.zeros_(self.ff_lora_B.weight)
+
+            if not context_pre_only:
+                self.ff_context_lora_A = nn.Linear(dim, lora_rank, bias=False)
+                self.ff_context_lora_B = nn.Linear(lora_rank, dim, bias=False)
+                nn.init.kaiming_uniform_(self.ff_context_lora_A.weight, a=math.sqrt(5))
+                nn.init.zeros_(self.ff_context_lora_B.weight)
+            else:
+                self.ff_context_lora_A = self.ff_context_lora_B = None
+        else:
+            self.ff_lora_A = self.ff_lora_B = None
+            self.ff_context_lora_A = self.ff_context_lora_B = None
 
         self._chunk_size = None
         self._chunk_dim = 0
@@ -148,6 +168,8 @@ class JointPoMBlock(nn.Module):
             ff_output = _chunked_ff(self.ff, norm_hidden_states, self._chunk_size, self._chunk_dim)
         else:
             ff_output = self.ff(norm_hidden_states)
+        if self.ff_lora_A is not None:
+            ff_output = ff_output + self.ff_lora_B(self.ff_lora_A(norm_hidden_states))
         hidden_states = hidden_states + gate_mlp.unsqueeze(1) * ff_output
 
         # --- Text residual and FF ---
@@ -166,6 +188,10 @@ class JointPoMBlock(nn.Module):
                 )
             else:
                 context_ff_output = self.ff_context(norm_encoder_hidden_states)
+            if self.ff_context_lora_A is not None:
+                context_ff_output = context_ff_output + self.ff_context_lora_B(
+                    self.ff_context_lora_A(norm_encoder_hidden_states)
+                )
             encoder_hidden_states = encoder_hidden_states + c_gate_mlp.unsqueeze(1) * context_ff_output
 
         return encoder_hidden_states, hidden_states

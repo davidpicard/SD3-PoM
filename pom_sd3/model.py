@@ -57,6 +57,7 @@ class PomSD3Transformer2DModel(
         pom_expand: int = 2,
         pom_n_groups: int = 1,
         pom_n_sel_heads: int = 24,
+        lora_rank: int = 0,
     ):
         super().__init__()
         self.out_channels = out_channels if out_channels is not None else in_channels
@@ -80,6 +81,7 @@ class PomSD3Transformer2DModel(
             pom_expand=pom_expand,
             pom_n_groups=pom_n_groups,
             pom_n_sel_heads=pom_n_sel_heads,
+            lora_rank=lora_rank,
         )
         self.transformer_blocks = nn.ModuleList(
             [

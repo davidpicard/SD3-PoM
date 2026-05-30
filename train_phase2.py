@@ -64,6 +64,8 @@ def parse_args():
     p.add_argument("--max_steps", type=int, default=50_000)
     p.add_argument("--warmup_steps", type=int, default=500)
     p.add_argument("--block_loss_weight", type=float, default=0.1)
+    p.add_argument("--lora_rank", type=int, default=16,
+                   help="LoRA rank on FF layers in each block (0 to disable)")
     p.add_argument("--pure_block_steps", type=int, default=0,
                    help="For this many steps, train on block_loss only (no student forward / final_loss).")
     p.add_argument("--latent_height", type=int, default=64)
@@ -124,28 +126,24 @@ def _mse_mae_block(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 def teacher_forced_block_loss(
     raw_student,
-    teacher_attn_data: list[dict],
+    teacher_block_data: list[dict],
     device: torch.device,
 ) -> torch.Tensor:
-    """Compute block loss by running each student PoM on teacher's normalised states."""
+    """Block-level teacher forcing: run the full student block on teacher's pre-block
+    states and compare the full block output to the teacher's block output."""
     block_loss = torch.tensor(0.0, device=device)
-    for s_blk, cap in zip(raw_student.transformer_blocks, teacher_attn_data):
-        norm_img = cap.get('norm_img')
-        if norm_img is None:
+    for s_blk, cap in zip(raw_student.transformer_blocks, teacher_block_data):
+        hs_in = cap.get('hs_in')
+        if hs_in is None:
             continue
-        norm_text = cap.get('norm_text')
-        n_img = norm_img.shape[1]
-        joint = torch.cat([norm_img, norm_text], dim=1) if norm_text is not None else norm_img
-
-        pom_out = s_blk.pom(joint)
-        block_loss = block_loss + _mse_mae_block(pom_out[:, :n_img], cap['attn_img'])
-        if norm_text is not None and 'attn_text' in cap:
-            block_loss = block_loss + _mse_mae_block(pom_out[:, n_img:], cap['attn_text'])
-
-        if s_blk.pom2 is not None and 'norm_img2' in cap:
-            pom2_out = s_blk.pom2(cap['norm_img2'])
-            block_loss = block_loss + _mse_mae_block(pom2_out, cap['attn2_img'])
-
+        enc_hs_pred, hs_pred = s_blk(
+            hidden_states=hs_in,
+            encoder_hidden_states=cap.get('enc_hs_in'),
+            temb=cap['temb_in'],
+        )
+        block_loss = block_loss + _mse_mae_block(hs_pred, cap['hs_out'])
+        if enc_hs_pred is not None and cap.get('enc_hs_out') is not None:
+            block_loss = block_loss + _mse_mae_block(enc_hs_pred, cap['enc_hs_out'])
     return block_loss
 
 
@@ -314,6 +312,7 @@ def main():
             pooled_projection_dim=2048, out_channels=16,
             pos_embed_max_size=32, dual_attention_layers=(0,),
             pom_degree=2, pom_expand=2, pom_n_groups=1, pom_n_sel_heads=1,
+            lora_rank=4,
         ).to(device=device, dtype=torch.bfloat16)
 
     student.train()
@@ -358,43 +357,29 @@ def main():
             pooled = batch["pooled_projections"].to(device=device, dtype=torch.bfloat16)
             timestep = batch["timestep"].to(device=device)
 
-            # --- Teacher forward (no grad): capture attn inputs + outputs per block ---
+            # --- Teacher forward (no grad): capture block input/output per block ---
             if teacher is not None:
-                teacher_attn_data = [{} for _ in range(len(teacher.transformer_blocks))]
+                teacher_block_data = [{} for _ in range(len(teacher.transformer_blocks))]
                 teacher_hooks = []
 
                 for _i, _blk in enumerate(teacher.transformer_blocks):
-                    _cap = teacher_attn_data[_i]
+                    _cap = teacher_block_data[_i]
 
                     def _make_pre(_c):
                         def _hook(_m, _args, _kwargs):
-                            _c['norm_img'] = _kwargs.get('hidden_states')
-                            _c['norm_text'] = _kwargs.get('encoder_hidden_states')
+                            _c['hs_in']     = _kwargs.get('hidden_states')
+                            _c['enc_hs_in'] = _kwargs.get('encoder_hidden_states')
+                            _c['temb_in']   = _kwargs.get('temb')
                         return _hook
 
                     def _make_post(_c):
                         def _hook(_m, _inp, _out):
-                            _c['attn_img'] = _out[0].detach()
-                            if isinstance(_out, tuple) and len(_out) > 1 and _out[1] is not None:
-                                _c['attn_text'] = _out[1].detach()
+                            _c['enc_hs_out'] = _out[0].detach() if _out[0] is not None else None
+                            _c['hs_out']     = _out[1].detach()
                         return _hook
 
-                    teacher_hooks.append(_blk.attn.register_forward_pre_hook(_make_pre(_cap), with_kwargs=True))
-                    teacher_hooks.append(_blk.attn.register_forward_hook(_make_post(_cap)))
-
-                    if hasattr(_blk, 'attn2') and _blk.attn2 is not None:
-                        def _make_pre2(_c):
-                            def _hook(_m, _args, _kwargs):
-                                _c['norm_img2'] = _kwargs.get('hidden_states')
-                            return _hook
-
-                        def _make_post2(_c):
-                            def _hook(_m, _inp, _out):
-                                _c['attn2_img'] = (_out[0] if isinstance(_out, tuple) else _out).detach()
-                            return _hook
-
-                        teacher_hooks.append(_blk.attn2.register_forward_pre_hook(_make_pre2(_cap), with_kwargs=True))
-                        teacher_hooks.append(_blk.attn2.register_forward_hook(_make_post2(_cap)))
+                    teacher_hooks.append(_blk.register_forward_pre_hook(_make_pre(_cap), with_kwargs=True))
+                    teacher_hooks.append(_blk.register_forward_hook(_make_post(_cap)))
 
                 with torch.no_grad():
                     teacher_out = teacher(
@@ -409,12 +394,12 @@ def main():
             else:
                 # Smoke test: no teacher, skip block loss
                 teacher_out = torch.randn_like(hidden_states)
-                teacher_attn_data = []
+                teacher_block_data = []
 
-            # --- Block loss: student PoM on teacher's normalised states (with grad) ---
+            # --- Block loss: full student block on teacher's pre-block states (with grad) ---
             block_loss = (
-                teacher_forced_block_loss(raw_student, teacher_attn_data, device)
-                if teacher_attn_data else torch.tensor(0.0, device=device)
+                teacher_forced_block_loss(raw_student, teacher_block_data, device)
+                if teacher_block_data else torch.tensor(0.0, device=device)
             )
 
             # --- Student forward for final loss ---
