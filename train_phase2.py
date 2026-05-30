@@ -19,6 +19,8 @@ Or run locally for a smoke test (no checkpoint needed):
 import argparse
 import math
 import os
+import shutil
+import tempfile
 import time
 from pathlib import Path
 
@@ -179,7 +181,7 @@ def generate_samples(
             f"  Skipping samples at step {step}: VAE not found in {model_id}. "
             "Re-download without --skip_vae to enable sample generation."
         )
-        return []
+        return
 
     print(f"Generating sample images at step {step} ...")
     local = model_path.exists()
@@ -191,14 +193,21 @@ def generate_samples(
     pipe.transformer = student
     pipe.set_progress_bar_config(disable=True)
 
-    images = []
-    for prompt in SAMPLE_PROMPTS[:num_prompts]:
-        img = pipe(prompt, num_inference_steps=28, guidance_scale=4.5).images[0]
-        images.append(wandb.Image(img, caption=prompt))
+    tmpdir = tempfile.mkdtemp()
+    try:
+        images = []
+        for i, prompt in enumerate(SAMPLE_PROMPTS[:num_prompts]):
+            img = pipe(prompt, num_inference_steps=28, guidance_scale=4.5).images[0]
+            path = os.path.join(tmpdir, f"{i:03d}.jpg")
+            img.save(path, format="JPEG", quality=85)
+            images.append(wandb.Image(path, caption=prompt))
 
-    del pipe
-    torch.cuda.empty_cache()
-    return images
+        del pipe
+        torch.cuda.empty_cache()
+
+        wandb.log({"samples": images}, step=step)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -431,8 +440,7 @@ def main():
             # --- Image samples ---
             if is_main() and step > 0 and step % args.sample_every == 0 and not args.smoke_test:
                 raw_student.eval()
-                images = generate_samples(raw_student, args.model_id, step, device, num_prompts=args.num_sample_prompts)
-                wandb.log({"samples": images}, step=step)
+                generate_samples(raw_student, args.model_id, step, device, num_prompts=args.num_sample_prompts)
                 raw_student.train()
 
             step += 1
