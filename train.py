@@ -180,12 +180,14 @@ def generate_samples(
     # Pass transformer=None to skip loading it from disk — passing a
     # PomSD3Transformer2DModel directly triggers a type-mismatch fallback in
     # diffusers that tries to reload from the wrong path. Inject afterward.
+    # Load without dtype override — from_pretrained intentionally keeps the VAE
+    # in float32 even with dtype=bfloat16. Using .to() after loading forces all
+    # registered modules (text encoders + VAE) to bfloat16 consistently.
     pipe = StableDiffusion3Pipeline.from_pretrained(
         model_id,
         transformer=None,
-        dtype=torch.bfloat16,
         local_files_only=local,
-    ).to(device)
+    ).to(device=device, dtype=torch.bfloat16)
     pipe.transformer = student
     pipe.set_progress_bar_config(disable=True)
 
