@@ -75,10 +75,13 @@ def main():
     )
     pipe = pipe.to(args.device)
 
-    # Check for existing output shards to allow resuming
-    existing_shards = sorted(out_dir.glob("shard_*.npz"))
-    n_done = len(existing_shards) * args.shard_size
-    print(f"Output dir: {out_dir} — {len(existing_shards)} shards already done ({n_done} embeddings), resuming.")
+    # Load existing index (written after every shard) to allow safe resuming
+    index_path = out_dir / "index.json"
+    index: dict[str, int] = {}
+    if index_path.exists():
+        index = json.loads(index_path.read_text())
+    n_done = sum(index.values())
+    print(f"Output dir: {out_dir} — {len(index)} shards already done ({n_done} embeddings), resuming.")
 
     caption_iter = iter_captions(captions_dir)
 
@@ -91,18 +94,25 @@ def main():
             return
 
     enc_hs_buf, pooled_buf = [], []
-    shard_idx = len(existing_shards)
+    shard_idx = len(index)
     total = n_done
     batch: list[str] = []
 
     def flush_shard():
         nonlocal shard_idx
-        path = out_dir / f"shard_{shard_idx:05d}.npz"
+        name = f"shard_{shard_idx:05d}.npz"
+        path = out_dir / name
+        # Write to a temp file first, then rename atomically to avoid corrupt shards
+        tmp = path.with_suffix(".tmp")
         np.savez(
-            path,
+            tmp,
             encoder_hidden_states=np.stack(enc_hs_buf).astype(np.float16),
             pooled_projections=np.stack(pooled_buf).astype(np.float16),
         )
+        tmp.rename(path)
+        # Update index immediately after the rename so resuming is always consistent
+        index[name] = len(enc_hs_buf)
+        index_path.write_text(json.dumps(index, indent=2))
         enc_hs_buf.clear()
         pooled_buf.clear()
         shard_idx += 1

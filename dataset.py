@@ -1,4 +1,5 @@
 """Dataset of precomputed SD3.5 text embeddings paired with random noise latents."""
+import json
 import os
 from pathlib import Path
 
@@ -31,17 +32,36 @@ class EmbeddingDataset(Dataset):
         self.latent_shape = (latent_channels, latent_height, latent_width)
         self.max_timestep = max_timestep
 
-        self._shards: list[Path] = sorted(self.embeddings_dir.glob("*.npz"))
-        if not self._shards:
-            raise FileNotFoundError(f"No .npz shards found in {embeddings_dir}")
+        # Prefer the index.json written by precompute_embeddings.py (fast, no npz reads)
+        index_path = self.embeddings_dir / "index.json"
+        all_npz = sorted(self.embeddings_dir.glob("shard_*.npz"))
+        if not all_npz:
+            raise FileNotFoundError(f"No shard_*.npz files found in {embeddings_dir}")
 
-        # Build index: (shard_idx, sample_idx_within_shard)
-        self._index: list[tuple[int, int]] = []
-        self._shard_cache: dict[int, dict] = {}  # LRU would be nicer; dict is fine for now
-        for shard_idx, shard_path in enumerate(self._shards):
-            data = np.load(shard_path)
-            n = data["encoder_hidden_states"].shape[0]
-            self._index.extend((shard_idx, i) for i in range(n))
+        if index_path.exists():
+            shard_counts = json.load(open(index_path))
+            # Only keep shards that are listed in the index (fully written)
+            self._shards = [self.embeddings_dir / name for name in sorted(shard_counts)]
+            counts = [shard_counts[p.name] for p in self._shards]
+        else:
+            # Fallback: open each shard to read its length; skip corrupt ones
+            self._shards, counts = [], []
+            for path in all_npz:
+                try:
+                    n = np.load(path)["encoder_hidden_states"].shape[0]
+                    self._shards.append(path)
+                    counts.append(n)
+                except Exception as e:
+                    print(f"  WARNING: skipping corrupt shard {path.name}: {e}")
+
+        if not self._shards:
+            raise RuntimeError(f"No valid shards in {embeddings_dir}")
+
+        # Build flat index: (shard_idx, sample_idx_within_shard)
+        self._index: list[tuple[int, int]] = [
+            (si, i) for si, n in enumerate(counts) for i in range(n)
+        ]
+        self._shard_cache: dict[int, dict] = {}
 
         print(f"EmbeddingDataset: {len(self._index)} samples across {len(self._shards)} shards")
 
