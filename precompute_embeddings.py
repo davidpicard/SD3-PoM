@@ -15,13 +15,21 @@ import argparse
 import json
 from pathlib import Path
 
+import logging
+
 import numpy as np
 import torch
-import transformers
 from diffusers import StableDiffusion3Pipeline
 from tqdm import tqdm
 
-transformers.logging.set_verbosity_error()
+# Suppress CLIP's per-sample truncation warnings (expected for long captions).
+# The warning goes through Python's standard logging, not transformers' wrapper,
+# so set_verbosity_error() alone doesn't catch it.
+class _DropTruncationWarnings(logging.Filter):
+    def filter(self, record):
+        return "truncated because" not in record.getMessage()
+
+logging.getLogger("transformers").addFilter(_DropTruncationWarnings())
 
 
 def parse_args():
@@ -105,14 +113,15 @@ def main():
         nonlocal shard_idx
         name = f"shard_{shard_idx:05d}.npz"
         path = out_dir / name
-        # Write to a temp file first, then rename atomically to avoid corrupt shards
-        tmp = path.with_suffix(".tmp")
+        # Write to a temp file first, then rename atomically to avoid corrupt shards.
+        # Use a .npz suffix on the tmp name so numpy doesn't append a second one.
+        tmp = out_dir / f"shard_{shard_idx:05d}.tmp.npz"
         np.savez(
             tmp,
             encoder_hidden_states=np.stack(enc_hs_buf).astype(np.float16),
             pooled_projections=np.stack(pooled_buf).astype(np.float16),
         )
-        tmp.append(".npz").rename(path)
+        tmp.rename(path)
         # Update index immediately after the rename so resuming is always consistent
         index[name] = len(enc_hs_buf)
         index_path.write_text(json.dumps(index, indent=2))
