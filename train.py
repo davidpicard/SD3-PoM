@@ -25,7 +25,7 @@ import wandb
 from diffusers import SD3Transformer2DModel, StableDiffusion3Pipeline
 
 from dataset import EmbeddingDataset
-from pom_sd3 import PomSD3Transformer2DModel, SD35_MEDIUM_CONFIG, build_from_sd3_pretrained
+from pom_sd3 import PomSD3Transformer2DModel, SD35_MEDIUM_CONFIG, load_sd3_weights_into_pom
 
 
 # ---------------------------------------------------------------------------
@@ -258,18 +258,20 @@ def main():
     # --- Student ---
     if args.resume_from:
         print(f"[rank {local_rank}] Resuming student from {args.resume_from} ...")
-        student = PomSD3Transformer2DModel.from_pretrained(args.resume_from)
+        student = PomSD3Transformer2DModel.from_pretrained(args.resume_from).to(device=device, dtype=torch.bfloat16)
     elif not args.smoke_test:
-        print(f"[rank {local_rank}] Building student from SD3.5 pretrained ...")
-        student = build_from_sd3_pretrained(
-            model_id=args.model_id,
+        print(f"[rank {local_rank}] Initializing student from teacher weights ...")
+        student = PomSD3Transformer2DModel(
+            **SD35_MEDIUM_CONFIG,
             pom_degree=args.pom_degree,
             pom_expand=args.pom_expand,
             pom_n_groups=args.pom_n_groups,
             pom_n_sel_heads=args.pom_n_sel_heads,
-            torch_dtype=torch.bfloat16,
-            device=device,
-        )
+        ).to(dtype=torch.bfloat16)
+        teacher_sd = {k: v.cpu() for k, v in teacher.state_dict().items()}
+        load_sd3_weights_into_pom(student, teacher_sd)
+        del teacher_sd
+        student = student.to(device)
     else:
         student = PomSD3Transformer2DModel(
             sample_size=32, patch_size=2, in_channels=16, num_layers=2,
@@ -286,9 +288,20 @@ def main():
 
     raw_student = student.module if isinstance(student, DDP) else student
 
+    # --- Freeze everything except PoM layers ---
+    pom_fragments = (".pom.", ".pom2.")
+    for name, param in raw_student.named_parameters():
+        param.requires_grad_(any(f in name for f in pom_fragments))
+
+    pom_params = [p for p in raw_student.parameters() if p.requires_grad]
+    n_trainable = sum(p.numel() for p in pom_params)
+    n_total = sum(p.numel() for p in raw_student.parameters())
+    if is_main():
+        print(f"Trainable (PoM) params: {n_trainable / 1e6:.1f}M / {n_total / 1e6:.1f}M total")
+
     # --- Optimizer ---
     optimizer = torch.optim.AdamW(
-        student.parameters(),
+        pom_params,
         lr=args.lr,
         weight_decay=args.weight_decay,
         betas=(0.9, 0.999),
