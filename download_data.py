@@ -44,8 +44,8 @@ def parse_args():
     # Model options
     p.add_argument("--model_id", default="stabilityai/stable-diffusion-3.5-medium")
     p.add_argument("--model_dir", default="./models/sd3.5-medium")
-    p.add_argument("--skip_vae", action="store_true", default=True,
-                   help="Skip VAE weights (not needed for distillation training)")
+    p.add_argument("--skip_vae", action=argparse.BooleanOptionalAction, default=True,
+                   help="Skip VAE weights (not needed for distillation training; pass --no-skip-vae to include)")
 
     return p.parse_args()
 
