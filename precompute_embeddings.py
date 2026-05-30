@@ -17,8 +17,11 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import transformers
 from diffusers import StableDiffusion3Pipeline
 from tqdm import tqdm
+
+transformers.logging.set_verbosity_error()
 
 
 def parse_args():
