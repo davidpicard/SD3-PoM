@@ -65,8 +65,8 @@ def load_sd3_weights_into_pom(
 
     missing, unexpected = student.load_state_dict(transfer, strict=False)
 
-    # Filter: missing keys that are NOT PoM-specific are a problem
-    pom_key_fragments = (".pom.", ".pom2.")
+    # Filter: missing keys that are NOT PoM-specific or LoRA are a problem
+    pom_key_fragments = (".pom.", ".pom2.", ".ff_lora_", ".ff_context_lora_")
     non_pom_missing = [k for k in missing if not any(f in k for f in pom_key_fragments)]
     if strict_non_attention and non_pom_missing:
         raise RuntimeError(
