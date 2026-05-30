@@ -55,6 +55,9 @@ def parse_args():
     p.add_argument("--warmup_steps", type=int, default=1_000)
     p.add_argument("--block_loss_weight", type=float, default=0.1,
                    help="Weight for intermediate block losses vs final output loss")
+    p.add_argument("--pure_block_steps", type=int, default=0,
+                   help="For this many steps, train on block_loss only (no student forward / final_loss). "
+                        "Eliminates gradient conflict between the two objectives while PoM learns attention.")
     p.add_argument("--latent_height", type=int, default=64)
     p.add_argument("--latent_width", type=int, default=64)
 
@@ -441,16 +444,23 @@ def main():
             )
 
             # --- Student forward for final loss ---
-            student_out = raw_student(
-                hidden_states=hidden_states,
-                encoder_hidden_states=enc_hs,
-                pooled_projections=pooled,
-                timestep=timestep,
-            ).sample
-
-            # --- Combined loss ---
-            final_loss = _mse_mae(student_out, teacher_out)
-            total_loss = final_loss + args.block_loss_weight * block_loss
+            # During pure_block_steps, skip the student forward entirely: it
+            # creates gradient conflict (PoM receives two signals on different
+            # inputs — teacher-normalised states vs student-accumulated states).
+            # Once block_loss is low enough, final_loss adds the end-to-end signal.
+            pure_block_phase = step < args.pure_block_steps
+            if pure_block_phase:
+                final_loss = torch.tensor(0.0, device=device)
+                total_loss = block_loss
+            else:
+                student_out = raw_student(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=enc_hs,
+                    pooled_projections=pooled,
+                    timestep=timestep,
+                ).sample
+                final_loss = _mse_mae(student_out, teacher_out)
+                total_loss = final_loss + args.block_loss_weight * block_loss
             (total_loss / args.grad_accum_steps).backward()
 
             if (step + 1) % args.grad_accum_steps == 0:
@@ -467,6 +477,7 @@ def main():
             # --- Logging ---
             if is_main() and step % args.log_every == 0:
                 elapsed = time.time() - t0
+                phase_tag = "[block-only]" if pure_block_phase else "[joint]    "
                 log = {
                     "loss": total_loss.item(),
                     "final_loss": final_loss.item(),
@@ -477,7 +488,7 @@ def main():
                 }
                 wandb.log(log, step=step)
                 print(
-                    f"step={step:6d}  loss={log['loss']:.4f}  "
+                    f"step={step:6d} {phase_tag}  loss={log['loss']:.4f}  "
                     f"final={log['final_loss']:.4f}  block={log['block_loss']:.4f}  "
                     f"lr={lr:.2e}  {log['samples_per_sec']:.1f} samp/s"
                 )
