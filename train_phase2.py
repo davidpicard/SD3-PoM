@@ -122,13 +122,17 @@ def distillation_loss(
     def mse_mae(a, b):
         return F.mse_loss(a, b) + F.l1_loss(a, b)
 
+    def mse_mae_block(a, b):
+        scale = b.detach().std().clamp(min=1e-8)
+        return F.mse_loss(a / scale, b / scale) + F.l1_loss(a / scale, b / scale)
+
     final_loss = mse_mae(student_out, teacher_out)
 
     block_loss = torch.tensor(0.0, device=student_out.device)
     for (s_enc, s_img), (t_enc, t_img) in zip(student_intermediates, teacher_intermediates):
-        block_loss = block_loss + mse_mae(s_img, t_img)
+        block_loss = block_loss + mse_mae_block(s_img, t_img)
         if s_enc is not None and t_enc is not None:
-            block_loss = block_loss + mse_mae(s_enc, t_enc)
+            block_loss = block_loss + mse_mae_block(s_enc, t_enc)
 
     total = final_loss + block_weight * block_loss
     return {"loss": total, "final_loss": final_loss.detach(), "block_loss": block_loss.detach()}

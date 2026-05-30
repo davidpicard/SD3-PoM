@@ -184,8 +184,8 @@ class PomSD3Transformer2DModel(
 
             if return_intermediate:
                 intermediates.append((
-                    encoder_hidden_states.detach() if encoder_hidden_states is not None else None,
-                    hidden_states.detach(),
+                    encoder_hidden_states if encoder_hidden_states is not None else None,
+                    hidden_states,
                 ))
 
         hidden_states = self.norm_out(hidden_states, temb)
