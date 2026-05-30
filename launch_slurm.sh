@@ -34,7 +34,7 @@ srun torchrun \
         --pom_degree 4 \
         --pom_expand 2 \
         --pom_n_groups 1 \
-        --pom_n_sel_heads 1 \
+        --pom_n_sel_heads 24 \
         --log_every 50 \
         --save_every 2000 \
         --sample_every 2000 \

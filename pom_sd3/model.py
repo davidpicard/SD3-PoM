@@ -44,19 +44,19 @@ class PomSD3Transformer2DModel(
         in_channels: int = 16,
         num_layers: int = 24,
         attention_head_dim: int = 64,
-        num_attention_heads: int = 18,
+        num_attention_heads: int = 24,
         joint_attention_dim: int = 4096,
-        caption_projection_dim: int = 1152,
+        caption_projection_dim: int = 1536,
         pooled_projection_dim: int = 2048,
         out_channels: int = 16,
-        pos_embed_max_size: int = 96,
+        pos_embed_max_size: int = 384,
         dual_attention_layers: tuple[int, ...] = (),
         qk_norm: str | None = None,
         # PoM-specific hyperparameters
         pom_degree: int = 4,
         pom_expand: int = 2,
         pom_n_groups: int = 1,
-        pom_n_sel_heads: int = 18,
+        pom_n_sel_heads: int = 24,
     ):
         super().__init__()
         self.out_channels = out_channels if out_channels is not None else in_channels
