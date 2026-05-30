@@ -146,6 +146,11 @@ class PomSD3Transformer2DModel(
         """
         height, width = hidden_states.shape[-2:]
 
+        # Cast to model dtype so the pipeline can pass float32 latents safely
+        hidden_states = hidden_states.to(dtype=self.dtype)
+        encoder_hidden_states = encoder_hidden_states.to(dtype=self.dtype)
+        pooled_projections = pooled_projections.to(dtype=self.dtype)
+
         hidden_states = self.pos_embed(hidden_states)
         temb = self.time_text_embed(timestep, pooled_projections)
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
