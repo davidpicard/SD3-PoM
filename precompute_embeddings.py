@@ -22,14 +22,24 @@ import torch
 from diffusers import StableDiffusion3Pipeline
 from tqdm import tqdm
 
+import warnings
+
 # Suppress CLIP's per-sample truncation warnings (expected for long captions).
-# The warning goes through Python's standard logging, not transformers' wrapper,
-# so set_verbosity_error() alone doesn't catch it.
+# Filters on a parent logger don't apply to records propagated from child loggers,
+# so we must target the exact loggers that emit the warning.
 class _DropTruncationWarnings(logging.Filter):
     def filter(self, record):
         return "truncated because" not in record.getMessage()
 
-logging.getLogger("transformers").addFilter(_DropTruncationWarnings())
+_f = _DropTruncationWarnings()
+for _name in (
+    "transformers.models.clip.tokenization_clip",
+    "transformers.models.clip.tokenization_clip_fast",
+):
+    logging.getLogger(_name).addFilter(_f)
+
+# Cover any warnings.warn() path as well
+warnings.filterwarnings("ignore", message=".*truncated.*")
 
 
 def parse_args():
