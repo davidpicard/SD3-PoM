@@ -15,36 +15,33 @@ import argparse
 import json
 from pathlib import Path
 
-import re
-import sys
-import logging
-import warnings
+import contextlib
+import json
+import os
+from pathlib import Path
 
 import numpy as np
 import torch
 from diffusers import StableDiffusion3Pipeline
 from tqdm import tqdm
 
-# The CLIP tokenizer writes its truncation warning directly to stderr,
-# bypassing both the logging system and warnings.warn(). Wrap stderr so
-# any write containing the pattern is silently dropped.
-class _SuppressTruncationStderr:
-    _pat = re.compile(r"truncated because")
 
-    def __init__(self, real):
-        self._real = real
+@contextlib.contextmanager
+def _silence_fd2():
+    """Redirect file descriptor 2 to /dev/null for the duration of the block.
 
-    def write(self, msg):
-        if not self._pat.search(msg):
-            self._real.write(msg)
-
-    def flush(self):
-        self._real.flush()
-
-    def __getattr__(self, name):
-        return getattr(self._real, name)
-
-sys.stderr = _SuppressTruncationStderr(sys.stderr)
+    The fast tokenizer (a Rust extension) writes directly to fd 2, bypassing
+    Python's sys.stderr, so only an OS-level redirect works.
+    """
+    old_fd = os.dup(2)
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, 2)
+    os.close(devnull)
+    try:
+        yield
+    finally:
+        os.dup2(old_fd, 2)
+        os.close(old_fd)
 
 
 def parse_args():
@@ -150,11 +147,12 @@ def main():
         shard_idx += 1
 
     def process_batch(captions: list[str]):
-        prompt_embeds, _, pooled_embeds, _ = pipe.encode_prompt(
-            prompt=captions,
-            prompt_2=captions,
-            prompt_3=captions,
-        )
+        with _silence_fd2():
+            prompt_embeds, _, pooled_embeds, _ = pipe.encode_prompt(
+                prompt=captions,
+                prompt_2=captions,
+                prompt_3=captions,
+            )
         enc_hs_buf.extend(prompt_embeds.cpu().half().numpy())
         pooled_buf.extend(pooled_embeds.cpu().half().numpy())
 

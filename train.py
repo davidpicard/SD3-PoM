@@ -62,7 +62,7 @@ def parse_args():
     p.add_argument("--log_every", type=int, default=50)
     p.add_argument("--save_every", type=int, default=2_000)
     p.add_argument("--sample_every", type=int, default=2_000)
-    p.add_argument("--num_sample_prompts", type=int, default=4)
+    p.add_argument("--num_sample_prompts", type=int, default=25)
     p.add_argument("--wandb_project", default="sd3-pom")
     p.add_argument("--wandb_run_name", default=None)
     p.add_argument("--wandb_offline", action="store_true",
@@ -159,18 +159,38 @@ SAMPLE_PROMPTS = [
 
 
 @torch.no_grad()
-def generate_samples(student: PomSD3Transformer2DModel, model_id: str, step: int, device):
+def generate_samples(
+    student: PomSD3Transformer2DModel,
+    model_id: str,
+    step: int,
+    device,
+    num_prompts: int = 4,
+):
     """Generate images with the student and return wandb.Image list."""
+    model_path = Path(model_id)
+    if not (model_path / "vae").exists():
+        print(
+            f"  Skipping samples at step {step}: VAE not found in {model_id}. "
+            "Re-download without --skip_vae to enable sample generation."
+        )
+        return []
+
     print(f"Generating sample images at step {step} ...")
+    local = model_path.exists()
+    # Pass transformer=None to skip loading it from disk — passing a
+    # PomSD3Transformer2DModel directly triggers a type-mismatch fallback in
+    # diffusers that tries to reload from the wrong path. Inject afterward.
     pipe = StableDiffusion3Pipeline.from_pretrained(
         model_id,
-        transformer=student,
-        torch_dtype=torch.bfloat16,
+        transformer=None,
+        dtype=torch.bfloat16,
+        local_files_only=local,
     ).to(device)
+    pipe.transformer = student
     pipe.set_progress_bar_config(disable=True)
 
     images = []
-    for prompt in SAMPLE_PROMPTS:
+    for prompt in SAMPLE_PROMPTS[:num_prompts]:
         img = pipe(prompt, num_inference_steps=28, guidance_scale=4.5).images[0]
         images.append(wandb.Image(img, caption=prompt))
 
@@ -426,7 +446,7 @@ def main():
             # --- Image samples ---
             if is_main() and step > 0 and step % args.sample_every == 0 and not args.smoke_test:
                 raw_student.eval()
-                images = generate_samples(raw_student, args.model_id, step, device)
+                images = generate_samples(raw_student, args.model_id, step, device, num_prompts=args.num_sample_prompts)
                 wandb.log({"samples": images}, step=step)
                 raw_student.train()
 
