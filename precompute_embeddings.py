@@ -114,6 +114,11 @@ def main():
             print("All captions already processed.")
             return
 
+    enc_dir = out_dir / "enc"
+    pooled_dir = out_dir / "pooled"
+    enc_dir.mkdir(exist_ok=True)
+    pooled_dir.mkdir(exist_ok=True)
+
     enc_hs_buf, pooled_buf = [], []
     shard_idx = len(index)
     total = n_done
@@ -121,18 +126,18 @@ def main():
 
     def flush_shard():
         nonlocal shard_idx
-        name = f"shard_{shard_idx:05d}.npz"
-        path = out_dir / name
-        # Write to a temp file first, then rename atomically to avoid corrupt shards.
-        # Use a .npz suffix on the tmp name so numpy doesn't append a second one.
-        tmp = out_dir / f"shard_{shard_idx:05d}.tmp.npz"
-        np.savez(
-            tmp,
-            encoder_hidden_states=np.stack(enc_hs_buf).astype(np.float16),
-            pooled_projections=np.stack(pooled_buf).astype(np.float16),
-        )
-        tmp.rename(path)
-        # Update index immediately after the rename so resuming is always consistent
+        name = f"shard_{shard_idx:05d}"
+        enc_arr = np.stack(enc_hs_buf).astype(np.float16)
+        pooled_arr = np.stack(pooled_buf).astype(np.float16)
+
+        # Write to temp files first, then rename atomically
+        enc_tmp = enc_dir / f"{name}.tmp.npy"
+        pooled_tmp = pooled_dir / f"{name}.tmp.npy"
+        np.save(enc_tmp, enc_arr)
+        np.save(pooled_tmp, pooled_arr)
+        enc_tmp.rename(enc_dir / f"{name}.npy")
+        pooled_tmp.rename(pooled_dir / f"{name}.npy")
+
         index[name] = len(enc_hs_buf)
         index_path.write_text(json.dumps(index, indent=2))
         enc_hs_buf.clear()

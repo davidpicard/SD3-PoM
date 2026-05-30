@@ -234,7 +234,7 @@ def main():
         batch_size=args.batch_size,
         sampler=sampler,
         shuffle=(sampler is None),
-        num_workers=4,
+        num_workers=2,
         pin_memory=True,
         drop_last=True,
     )

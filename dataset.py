@@ -1,6 +1,20 @@
-"""Dataset of precomputed SD3.5 text embeddings paired with random noise latents."""
+"""Dataset of precomputed SD3.5 text embeddings.
+
+Storage layout (preferred — supports mmap):
+    embeddings/
+        index.json              # {"shard_00000": N, ...}
+        enc/shard_00000.npy    # (N, seq_len, 4096) float16
+        pooled/shard_00000.npy # (N, 2048) float16
+
+Legacy layout (npz shards — loads the full shard into RAM, ~27 GB each):
+    embeddings/
+        index.json
+        shard_00000.npz
+
+Use migrate_embeddings.py to convert legacy shards to the npy layout.
+"""
 import json
-import os
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -9,15 +23,12 @@ from torch.utils.data import Dataset
 
 
 class EmbeddingDataset(Dataset):
-    """Loads precomputed text embeddings from a directory of .npz shards.
+    """Random-access dataset over precomputed text embeddings.
 
-    Each shard is a dict with keys:
-        encoder_hidden_states: (N, L, 4096) float16
-        pooled_projections:    (N, 2048)    float16
-
-    During __getitem__, returns a random noise latent paired with one embedding.
-    The noise is freshly sampled each call so the model sees different inputs
-    across epochs without storing latents on disk.
+    With npy layout, each __getitem__ reads only 2 rows (~2 MB) from
+    mmap'd files — the OS page cache handles the rest. With legacy npz
+    layout, the first access to a shard loads the full file (~27 GB);
+    a warning is printed to encourage migration.
     """
 
     def __init__(
@@ -32,69 +43,76 @@ class EmbeddingDataset(Dataset):
         self.latent_shape = (latent_channels, latent_height, latent_width)
         self.max_timestep = max_timestep
 
-        # Prefer the index.json written by precompute_embeddings.py (fast, no npz reads)
         index_path = self.embeddings_dir / "index.json"
-        all_npz = sorted(self.embeddings_dir.glob("shard_*.npz"))
-        if not all_npz:
-            raise FileNotFoundError(f"No shard_*.npz files found in {embeddings_dir}")
+        if not index_path.exists():
+            raise FileNotFoundError(f"No index.json found in {embeddings_dir}")
+        shard_counts: dict[str, int] = json.loads(index_path.read_text())
 
-        if index_path.exists():
-            shard_counts = json.load(open(index_path))
-            # Only keep shards that are listed in the index (fully written)
-            self._shards = [self.embeddings_dir / name for name in sorted(shard_counts)]
-            counts = [shard_counts[p.name] for p in self._shards]
+        # Detect layout
+        enc_dir = self.embeddings_dir / "enc"
+        self._use_npy = enc_dir.is_dir()
+
+        if self._use_npy:
+            self._enc_paths = [enc_dir / f"{name}.npy" for name in sorted(shard_counts)]
+            self._pooled_paths = [
+                self.embeddings_dir / "pooled" / f"{name}.npy"
+                for name in sorted(shard_counts)
+            ]
+            # Open mmap handles once — workers inherit them via fork
+            self._enc_mm = [
+                np.load(str(p), mmap_mode="r") for p in self._enc_paths
+            ]
+            self._pooled_mm = [
+                np.load(str(p), mmap_mode="r") for p in self._pooled_paths
+            ]
         else:
-            # Fallback: open each shard to read its length; skip corrupt ones
-            self._shards, counts = [], []
-            for path in all_npz:
-                try:
-                    n = np.load(path)["encoder_hidden_states"].shape[0]
-                    self._shards.append(path)
-                    counts.append(n)
-                except Exception as e:
-                    print(f"  WARNING: skipping corrupt shard {path.name}: {e}")
+            warnings.warn(
+                "Legacy npz shards detected. Each shard loads fully into RAM (~27 GB). "
+                "Run migrate_embeddings.py to convert to npy format.",
+                stacklevel=2,
+            )
+            self._npz_paths = [
+                self.embeddings_dir / f"{name}.npz" for name in sorted(shard_counts)
+            ]
+            self._npz_cache: dict[int, dict] = {}
 
-        if not self._shards:
-            raise RuntimeError(f"No valid shards in {embeddings_dir}")
-
-        # Build flat index: (shard_idx, sample_idx_within_shard)
+        counts = [shard_counts[k] for k in sorted(shard_counts)]
         self._index: list[tuple[int, int]] = [
             (si, i) for si, n in enumerate(counts) for i in range(n)
         ]
-        self._shard_cache: dict[int, dict] = {}
-
-        print(f"EmbeddingDataset: {len(self._index)} samples across {len(self._shards)} shards")
+        print(f"EmbeddingDataset: {len(self._index)} samples, "
+              f"{'npy/mmap' if self._use_npy else 'npz (legacy)'} format")
 
     def __len__(self) -> int:
         return len(self._index)
 
-    def _load_shard(self, shard_idx: int) -> dict:
-        if shard_idx not in self._shard_cache:
-            if len(self._shard_cache) > 4:
-                # Evict oldest
-                oldest = next(iter(self._shard_cache))
-                del self._shard_cache[oldest]
-            data = np.load(self._shards[shard_idx])
-            self._shard_cache[shard_idx] = {
-                "encoder_hidden_states": torch.from_numpy(data["encoder_hidden_states"]),
-                "pooled_projections": torch.from_numpy(data["pooled_projections"]),
+    def _load_npz(self, shard_idx: int) -> dict:
+        if shard_idx not in self._npz_cache:
+            if len(self._npz_cache) > 1:
+                oldest = next(iter(self._npz_cache))
+                del self._npz_cache[oldest]
+            data = np.load(self._npz_paths[shard_idx])
+            self._npz_cache[shard_idx] = {
+                "enc": data["encoder_hidden_states"],
+                "pooled": data["pooled_projections"],
             }
-        return self._shard_cache[shard_idx]
+        return self._npz_cache[shard_idx]
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         shard_idx, sample_idx = self._index[idx]
-        shard = self._load_shard(shard_idx)
 
-        encoder_hidden_states = shard["encoder_hidden_states"][sample_idx].float()
-        pooled_projections = shard["pooled_projections"][sample_idx].float()
-
-        # Fresh random noise latent each time
-        noise = torch.randn(self.latent_shape)
-        timestep = torch.randint(0, self.max_timestep, (1,)).item()
+        if self._use_npy:
+            # .copy() makes the slice contiguous and writable (required by torch)
+            enc = torch.from_numpy(self._enc_mm[shard_idx][sample_idx].copy()).float()
+            pooled = torch.from_numpy(self._pooled_mm[shard_idx][sample_idx].copy()).float()
+        else:
+            shard = self._load_npz(shard_idx)
+            enc = torch.from_numpy(shard["enc"][sample_idx]).float()
+            pooled = torch.from_numpy(shard["pooled"][sample_idx]).float()
 
         return {
-            "hidden_states": noise,
-            "encoder_hidden_states": encoder_hidden_states,
-            "pooled_projections": pooled_projections,
-            "timestep": timestep,
+            "hidden_states": torch.randn(self.latent_shape),
+            "encoder_hidden_states": enc,
+            "pooled_projections": pooled,
+            "timestep": torch.randint(0, self.max_timestep, (1,)).item(),
         }
