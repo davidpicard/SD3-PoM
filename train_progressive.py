@@ -95,7 +95,7 @@ def parse_args():
     p.add_argument("--log_every", type=int, default=50)
     p.add_argument("--save_every", type=int, default=2_000)
     p.add_argument("--sample_every", type=int, default=2_000)
-    p.add_argument("--num_sample_prompts", type=int, default=4)
+    p.add_argument("--num_sample_prompts", type=int, default=25)
     p.add_argument("--wandb_project", default="sd3-pom")
     p.add_argument("--wandb_run_name", default=None)
     p.add_argument("--wandb_offline", action="store_true")
