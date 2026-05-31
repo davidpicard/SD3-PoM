@@ -1,4 +1,5 @@
 """PomSD3Transformer2DModel: SD3.5 transformer with PoM instead of attention."""
+import math
 from typing import Any
 
 import torch
@@ -104,7 +105,39 @@ class PomSD3Transformer2DModel(
         self.proj_out = nn.Linear(
             self.inner_dim, patch_size * patch_size * self.out_channels, bias=True
         )
+        if lora_rank > 0:
+            out_features = patch_size * patch_size * self.out_channels
+            self.proj_out_lora_A = nn.Linear(self.inner_dim, lora_rank, bias=False)
+            self.proj_out_lora_B = nn.Linear(lora_rank, out_features, bias=False)
+            nn.init.kaiming_uniform_(self.proj_out_lora_A.weight, a=math.sqrt(5))
+            nn.init.zeros_(self.proj_out_lora_B.weight)
+        else:
+            self.proj_out_lora_A = self.proj_out_lora_B = None
         self.gradient_checkpointing = False
+
+    def merge_lora(self) -> None:
+        """Merge LoRA weights into FF down-projections and remove LoRA parameters.
+
+        After this call lora_rank is effectively 0: no extra memory, no extra
+        computation. save_pretrained() produces a checkpoint without LoRA keys.
+        """
+        for blk in self.transformer_blocks:
+            if getattr(blk, 'ff_lora_A', None) is not None:
+                blk.ff.net[2].weight.data += blk.ff_lora_B.weight.data @ blk.ff_lora_A.weight.data
+                delattr(blk, 'ff_lora_A')
+                delattr(blk, 'ff_lora_B')
+            if getattr(blk, 'ff_context_lora_A', None) is not None:
+                blk.ff_context.net[2].weight.data += (
+                    blk.ff_context_lora_B.weight.data @ blk.ff_context_lora_A.weight.data
+                )
+                delattr(blk, 'ff_context_lora_A')
+                delattr(blk, 'ff_context_lora_B')
+        if getattr(self, 'proj_out_lora_A', None) is not None:
+            self.proj_out.weight.data += self.proj_out_lora_B.weight.data @ self.proj_out_lora_A.weight.data
+            delattr(self, 'proj_out_lora_A')
+            delattr(self, 'proj_out_lora_B')
+        new_cfg = {**self._internal_dict, 'lora_rank': 0}
+        object.__setattr__(self, '_internal_dict', self._internal_dict.__class__(new_cfg))
 
     def enable_forward_chunking(self, chunk_size: int | None = None, dim: int = 0) -> None:
         chunk_size = chunk_size or 1
@@ -191,7 +224,11 @@ class PomSD3Transformer2DModel(
                 ))
 
         hidden_states = self.norm_out(hidden_states, temb)
-        hidden_states = self.proj_out(hidden_states)
+        proj_in = hidden_states
+        hidden_states = self.proj_out(proj_in)
+        proj_lora_A = getattr(self, 'proj_out_lora_A', None)
+        if proj_lora_A is not None:
+            hidden_states = hidden_states + self.proj_out_lora_B(proj_lora_A(proj_in))
 
         # Unpatchify
         patch_size = self.config.patch_size

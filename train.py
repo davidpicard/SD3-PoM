@@ -339,7 +339,7 @@ def main():
     raw_student = student
 
     # --- Freeze everything except PoM and LoRA layers ---
-    pom_fragments = (".pom.", ".pom2.", ".ff_lora_", ".ff_context_lora_")
+    pom_fragments = (".pom.", ".pom2.", ".ff_lora_", ".ff_context_lora_", "proj_out_lora_", "norm_out.")
     for name, param in raw_student.named_parameters():
         param.requires_grad_(any(f in name for f in pom_fragments))
 
@@ -497,9 +497,10 @@ def main():
 
     # --- Final save ---
     if is_main():
+        raw_student.merge_lora()
         final_dir = out_dir / "final"
         raw_student.save_pretrained(final_dir)
-        print(f"Training complete. Final model saved to {final_dir}")
+        print(f"Training complete. Final model (LoRA merged) saved to {final_dir}")
         wandb.finish()
 
     cleanup_ddp()

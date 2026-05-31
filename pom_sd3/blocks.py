@@ -16,9 +16,6 @@ from diffusers.utils.torch_utils import maybe_allow_in_graph
 from pom import PoM
 
 
-def _chunked_ff(ff: nn.Module, x: torch.Tensor, chunk_size: int, dim: int) -> torch.Tensor:
-    return torch.cat([ff(hid) for hid in x.split(chunk_size, dim=dim)], dim=dim)
-
 
 @maybe_allow_in_graph
 class JointPoMBlock(nn.Module):
@@ -95,15 +92,17 @@ class JointPoMBlock(nn.Module):
             self.norm2_context = None
             self.ff_context = None
 
-        # --- LoRA on FF layers (trained alongside PoM to absorb approximation error) ---
+        # --- LoRA on FF down-projections (applied at x_gate = GELU output, enables exact merge) ---
         if lora_rank > 0:
-            self.ff_lora_A = nn.Linear(dim, lora_rank, bias=False)
+            inner_dim = self.ff.net[2].in_features  # dim * 4
+            self.ff_lora_A = nn.Linear(inner_dim, lora_rank, bias=False)
             self.ff_lora_B = nn.Linear(lora_rank, dim, bias=False)
             nn.init.kaiming_uniform_(self.ff_lora_A.weight, a=math.sqrt(5))
             nn.init.zeros_(self.ff_lora_B.weight)
 
             if not context_pre_only:
-                self.ff_context_lora_A = nn.Linear(dim, lora_rank, bias=False)
+                ctx_inner = self.ff_context.net[2].in_features
+                self.ff_context_lora_A = nn.Linear(ctx_inner, lora_rank, bias=False)
                 self.ff_context_lora_B = nn.Linear(lora_rank, dim, bias=False)
                 nn.init.kaiming_uniform_(self.ff_context_lora_A.weight, a=math.sqrt(5))
                 nn.init.zeros_(self.ff_context_lora_B.weight)
@@ -164,12 +163,23 @@ class JointPoMBlock(nn.Module):
         # --- Image FF ---
         norm_hidden_states = self.norm2(hidden_states)
         norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+        ff_lora_A = getattr(self, 'ff_lora_A', None)
         if self._chunk_size is not None:
-            ff_output = _chunked_ff(self.ff, norm_hidden_states, self._chunk_size, self._chunk_dim)
+            def _ff_with_lora(chunk):
+                x_gate = self.ff.net[1](self.ff.net[0](chunk))
+                out = self.ff.net[2](x_gate)
+                if ff_lora_A is not None:
+                    out = out + self.ff_lora_B(ff_lora_A(x_gate))
+                return out
+            ff_output = torch.cat(
+                [_ff_with_lora(h) for h in norm_hidden_states.split(self._chunk_size, dim=self._chunk_dim)],
+                dim=self._chunk_dim,
+            )
         else:
-            ff_output = self.ff(norm_hidden_states)
-        if self.ff_lora_A is not None:
-            ff_output = ff_output + self.ff_lora_B(self.ff_lora_A(norm_hidden_states))
+            x_gate = self.ff.net[1](self.ff.net[0](norm_hidden_states))
+            ff_output = self.ff.net[2](x_gate)
+            if ff_lora_A is not None:
+                ff_output = ff_output + self.ff_lora_B(ff_lora_A(x_gate))
         hidden_states = hidden_states + gate_mlp.unsqueeze(1) * ff_output
 
         # --- Text residual and FF ---
@@ -182,16 +192,23 @@ class JointPoMBlock(nn.Module):
             norm_encoder_hidden_states = (
                 norm_encoder_hidden_states * (1 + c_scale_mlp[:, None]) + c_shift_mlp[:, None]
             )
+            ff_context_lora_A = getattr(self, 'ff_context_lora_A', None)
             if self._chunk_size is not None:
-                context_ff_output = _chunked_ff(
-                    self.ff_context, norm_encoder_hidden_states, self._chunk_size, self._chunk_dim
+                def _ctx_ff_with_lora(chunk):
+                    x_gate = self.ff_context.net[1](self.ff_context.net[0](chunk))
+                    out = self.ff_context.net[2](x_gate)
+                    if ff_context_lora_A is not None:
+                        out = out + self.ff_context_lora_B(ff_context_lora_A(x_gate))
+                    return out
+                context_ff_output = torch.cat(
+                    [_ctx_ff_with_lora(h) for h in norm_encoder_hidden_states.split(self._chunk_size, dim=self._chunk_dim)],
+                    dim=self._chunk_dim,
                 )
             else:
-                context_ff_output = self.ff_context(norm_encoder_hidden_states)
-            if self.ff_context_lora_A is not None:
-                context_ff_output = context_ff_output + self.ff_context_lora_B(
-                    self.ff_context_lora_A(norm_encoder_hidden_states)
-                )
+                x_gate = self.ff_context.net[1](self.ff_context.net[0](norm_encoder_hidden_states))
+                context_ff_output = self.ff_context.net[2](x_gate)
+                if ff_context_lora_A is not None:
+                    context_ff_output = context_ff_output + self.ff_context_lora_B(ff_context_lora_A(x_gate))
             encoder_hidden_states = encoder_hidden_states + c_gate_mlp.unsqueeze(1) * context_ff_output
 
         return encoder_hidden_states, hidden_states
