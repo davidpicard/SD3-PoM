@@ -7,6 +7,7 @@ import torch.nn as nn
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.loaders import FromOriginalModelMixin, PeftAdapterMixin, SD3Transformer2DLoadersMixin
+from diffusers.models.attention import JointTransformerBlock
 from diffusers.models.embeddings import CombinedTimestepTextProjEmbeddings, PatchEmbed
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.modeling_utils import ModelMixin
@@ -59,6 +60,9 @@ class PomSD3Transformer2DModel(
         pom_n_groups: int = 1,
         pom_n_sel_heads: int = 24,
         lora_rank: int = 0,
+        # Progressive replacement: last n_pom_blocks blocks are JointPoMBlock,
+        # first (num_layers - n_pom_blocks) blocks are JointTransformerBlock (frozen attention).
+        n_pom_blocks: int | None = None,
     ):
         super().__init__()
         self.out_channels = out_channels if out_channels is not None else in_channels
@@ -77,6 +81,9 @@ class PomSD3Transformer2DModel(
         )
         self.context_embedder = nn.Linear(joint_attention_dim, caption_projection_dim)
 
+        n_pom = num_layers if n_pom_blocks is None else n_pom_blocks
+        n_attn = num_layers - n_pom  # first n_attn blocks stay as JointTransformerBlock
+
         pom_kwargs = dict(
             pom_degree=pom_degree,
             pom_expand=pom_expand,
@@ -86,6 +93,14 @@ class PomSD3Transformer2DModel(
         )
         self.transformer_blocks = nn.ModuleList(
             [
+                JointTransformerBlock(
+                    dim=self.inner_dim,
+                    num_attention_heads=num_attention_heads,
+                    attention_head_dim=attention_head_dim,
+                    context_pre_only=(i == num_layers - 1),
+                    qk_norm=qk_norm,
+                    use_dual_attention=(i in dual_attention_layers),
+                ) if i < n_attn else
                 JointPoMBlock(
                     dim=self.inner_dim,
                     num_attention_heads=num_attention_heads,
