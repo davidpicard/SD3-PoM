@@ -64,10 +64,13 @@ def parse_args():
                         "Eliminates gradient conflict between the two objectives while PoM learns attention.")
     p.add_argument("--latent_height", type=int, default=64)
     p.add_argument("--latent_width", type=int, default=64)
-    p.add_argument("--teacher_steps", type=int, default=4,
-                   help="Euler steps for teacher x_0 generation per batch")
+    p.add_argument("--teacher_steps_max", type=int, default=28,
+                   help="Max Euler steps for teacher x_0 generation. Actual steps scale as "
+                        "max(1, round(teacher_steps_max * (1 - t_mean/1000))) so high-t batches "
+                        "use fewer steps where x_0 quality barely affects x_t.")
     p.add_argument("--amortize_k", type=int, default=2,
-                   help="Block-distillation passes per teacher-generated x_0 (amortizes teacher cost)")
+                   help="Independent (t → x_0 → x_t) passes per optimizer step; "
+                        "each uses dynamically-scaled teacher steps")
     p.add_argument("--uncond_prob", type=float, default=0.1,
                    help="Fraction of batches where enc_hs/pooled are zeroed to train unconditional path")
 
@@ -249,7 +252,7 @@ def generate_samples(
     try:
         images = []
         for i, prompt in enumerate(SAMPLE_PROMPTS[:num_prompts]):
-            img = pipe(prompt, num_inference_steps=16, guidance_scale=4.5).images[0]
+            img = pipe(prompt, num_inference_steps=28, guidance_scale=1.0).images[0]
             path = os.path.join(tmpdir, f"{i:03d}.jpg")
             img.save(path, format="JPEG", quality=85)
             images.append(wandb.Image(path, caption=prompt))
@@ -422,27 +425,31 @@ def main():
                 enc_hs = torch.zeros_like(enc_hs)
                 pooled = torch.zeros_like(pooled)
 
-            # Generate clean latent x_0 with teacher (no grad) so that
-            # x_t = (1-sigma)*x_0 + sigma*eps is a realistic input for any t.
-            if teacher is not None:
-                x_0 = teacher_generate_x0(
-                    teacher, scheduler, enc_hs, pooled,
-                    args.latent_height, args.latent_width,
-                    device, n_steps=args.teacher_steps,
-                )
-            else:
-                # Smoke test: skip teacher, use pure noise as stand-in
-                x_0 = torch.randn(B, 16, 32, 32, device=device, dtype=torch.bfloat16)
-
-            # Amortize: K (x_t, t) pairs per x_0
+            # K independent (t → n_steps → x_0 → x_t → loss) passes per optimizer step.
+            # Teacher steps scale with (1 - sigma): at high t, x_t is mostly noise so a
+            # rough x_0 contributes little contamination; at low t, x_t ≈ x_0 so quality matters.
             pure_block_phase = step < args.pure_block_steps
             K = args.amortize_k
             total_loss = torch.tensor(0.0, device=device)
             final_loss = torch.tensor(0.0, device=device)
             block_loss = torch.tensor(0.0, device=device)
+            teacher_steps_sum = 0
 
             for _ in range(K):
                 timestep = torch.randint(1, 999, (B,), device=device)
+
+                if teacher is not None:
+                    t_frac = 1.0 - timestep.float().mean().item() / 1000.0
+                    n_steps = max(1, round(args.teacher_steps_max * t_frac))
+                    teacher_steps_sum += n_steps
+                    x_0 = teacher_generate_x0(
+                        teacher, scheduler, enc_hs, pooled,
+                        args.latent_height, args.latent_width,
+                        device, n_steps=n_steps,
+                    )
+                else:
+                    x_0 = torch.randn(B, 16, 32, 32, device=device, dtype=torch.bfloat16)
+
                 sigma = (timestep.float() / 1000).view(B, 1, 1, 1)
                 eps = torch.randn_like(x_0)
                 x_t = ((1 - sigma) * x_0 + sigma * eps).to(x_0.dtype)
@@ -530,6 +537,7 @@ def main():
                     "loss": total_loss.item(),
                     "final_loss": final_loss.item(),
                     "block_loss": block_loss.item(),
+                    "teacher_steps_avg": teacher_steps_sum / K if teacher is not None else 0,
                     "lr": lr,
                     "step": step,
                     "samples_per_sec": (step + 1) * args.batch_size * (dist.get_world_size() if dist.is_initialized() else 1) / elapsed,
