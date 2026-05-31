@@ -40,6 +40,7 @@ from diffusers import (
     FlowMatchEulerDiscreteScheduler,
     StableDiffusion3Pipeline,
 )
+from diffusers.models.attention import JointTransformerBlock
 
 from dataset import EmbeddingDataset
 from pom_sd3 import (
@@ -176,6 +177,8 @@ def teacher_forced_block_loss(
 ) -> torch.Tensor:
     block_loss = torch.tensor(0.0, device=device)
     for s_blk, cap in zip(raw_student.transformer_blocks, teacher_block_data):
+        if isinstance(s_blk, JointTransformerBlock):
+            continue  # identical to teacher → zero loss, skip forward pass
         hs_in = cap.get("hs_in")
         if hs_in is None:
             continue
@@ -432,12 +435,50 @@ def main():
                 )
                 block_loss = block_loss + blk_loss_k.detach() / K
 
-                student_out = raw_student(
-                    hidden_states=x_t,
-                    encoder_hidden_states=enc_hs,
-                    pooled_projections=pooled,
-                    timestep=timestep,
-                ).sample
+                # Student final pass: use teacher's captured boundary state so we only
+                # run the PoM blocks (+ norm_out + proj_out_lora) with gradients.
+                # Attention blocks 0..first_pom_idx-1 are frozen and identical to the
+                # teacher, so teacher_block_data already holds their exact output.
+                n_pom = raw_student.config.n_pom_blocks or num_layers
+                first_pom_idx = num_layers - n_pom
+
+                if first_pom_idx > 0 and teacher_block_data:
+                    hs_s = teacher_block_data[first_pom_idx - 1]["hs_out"]
+                    enc_hs_s = teacher_block_data[first_pom_idx - 1]["enc_hs_out"]
+                    temb_s = teacher_block_data[0]["temb_in"]
+
+                    for i in range(first_pom_idx, num_layers):
+                        enc_hs_s, hs_s = raw_student.transformer_blocks[i](
+                            hidden_states=hs_s,
+                            encoder_hidden_states=enc_hs_s,
+                            temb=temb_s,
+                        )
+
+                    hs_s = raw_student.norm_out(hs_s, temb_s)
+                    proj_in = hs_s
+                    hs_s = raw_student.proj_out(proj_in)
+                    if getattr(raw_student, "proj_out_lora_A", None) is not None:
+                        hs_s = hs_s + raw_student.proj_out_lora_B(
+                            raw_student.proj_out_lora_A(proj_in)
+                        )
+
+                    ps = raw_student.config.patch_size
+                    hp = args.latent_height // ps
+                    wp = args.latent_width // ps
+                    hs_s = hs_s.reshape(B, hp, wp, ps, ps, raw_student.out_channels)
+                    hs_s = torch.einsum("nhwpqc->nchpwq", hs_s)
+                    student_out = hs_s.reshape(
+                        B, raw_student.out_channels, args.latent_height, args.latent_width
+                    )
+                else:
+                    # All blocks are PoM (late training) or smoke test — full forward
+                    student_out = raw_student(
+                        hidden_states=x_t,
+                        encoder_hidden_states=enc_hs,
+                        pooled_projections=pooled,
+                        timestep=timestep,
+                    ).sample
+
                 fin_loss_k = _mse_mae(student_out, teacher_out)
                 final_loss = final_loss + fin_loss_k.detach() / K
 
