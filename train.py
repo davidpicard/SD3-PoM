@@ -21,8 +21,10 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, DistributedSampler
 
+import random
+
 import wandb
-from diffusers import SD3Transformer2DModel, StableDiffusion3Pipeline
+from diffusers import SD3Transformer2DModel, FlowMatchEulerDiscreteScheduler, StableDiffusion3Pipeline
 
 from dataset import EmbeddingDataset
 from pom_sd3 import PomSD3Transformer2DModel, SD35_MEDIUM_CONFIG, load_sd3_weights_into_pom
@@ -62,6 +64,12 @@ def parse_args():
                         "Eliminates gradient conflict between the two objectives while PoM learns attention.")
     p.add_argument("--latent_height", type=int, default=64)
     p.add_argument("--latent_width", type=int, default=64)
+    p.add_argument("--teacher_steps", type=int, default=4,
+                   help="Euler steps for teacher x_0 generation per batch")
+    p.add_argument("--amortize_k", type=int, default=2,
+                   help="Block-distillation passes per teacher-generated x_0 (amortizes teacher cost)")
+    p.add_argument("--uncond_prob", type=float, default=0.1,
+                   help="Fraction of batches where enc_hs/pooled are zeroed to train unconditional path")
 
     # Logging / checkpointing
     p.add_argument("--log_every", type=int, default=50)
@@ -101,6 +109,31 @@ def lr_schedule(step: int, warmup_steps: int, max_steps: int, base_lr: float) ->
         return base_lr * step / max(1, warmup_steps)
     progress = (step - warmup_steps) / max(1, max_steps - warmup_steps)
     return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+# ---------------------------------------------------------------------------
+# Teacher x_0 generation
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def teacher_generate_x0(
+    teacher: SD3Transformer2DModel,
+    scheduler: FlowMatchEulerDiscreteScheduler,
+    enc_hs: torch.Tensor,
+    pooled: torch.Tensor,
+    latent_h: int,
+    latent_w: int,
+    device: torch.device,
+    n_steps: int,
+) -> torch.Tensor:
+    """Run teacher Euler ODE for n_steps, returning a clean latent x_0."""
+    B = enc_hs.shape[0]
+    x = torch.randn(B, 16, latent_h, latent_w, device=device, dtype=torch.bfloat16)
+    scheduler.set_timesteps(n_steps, device=device)
+    for t in scheduler.timesteps:
+        v = teacher(x, enc_hs, pooled, t.expand(B)).sample
+        x = scheduler.step(v, t, x).prev_sample
+    return x
 
 
 # ---------------------------------------------------------------------------
@@ -216,7 +249,7 @@ def generate_samples(
     try:
         images = []
         for i, prompt in enumerate(SAMPLE_PROMPTS[:num_prompts]):
-            img = pipe(prompt, num_inference_steps=28, guidance_scale=4.5).images[0]
+            img = pipe(prompt, num_inference_steps=16, guidance_scale=4.5).images[0]
             path = os.path.join(tmpdir, f"{i:03d}.jpg")
             img.save(path, format="JPEG", quality=85)
             images.append(wandb.Image(path, caption=prompt))
@@ -302,9 +335,13 @@ def main():
         teacher.eval()
         for p in teacher.parameters():
             p.requires_grad_(False)
+        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+            args.model_id, subfolder="scheduler",
+        )
     else:
         # Lightweight fake teacher for smoke test
         teacher = None
+        scheduler = None
 
     # --- Student ---
     if args.resume_from:
@@ -376,75 +413,103 @@ def main():
             for pg in optimizer.param_groups:
                 pg["lr"] = lr
 
-            hidden_states = batch["hidden_states"].to(device=device, dtype=torch.bfloat16)
             enc_hs = batch["encoder_hidden_states"].to(device=device, dtype=torch.bfloat16)
             pooled = batch["pooled_projections"].to(device=device, dtype=torch.bfloat16)
-            timestep = batch["timestep"].to(device=device)
+            B = enc_hs.shape[0]
 
-            # --- Teacher forward (no grad): capture block input/output per block ---
+            # Unconditional dropout: teach student the null-embedding path for CFG
+            if random.random() < args.uncond_prob:
+                enc_hs = torch.zeros_like(enc_hs)
+                pooled = torch.zeros_like(pooled)
+
+            # Generate clean latent x_0 with teacher (no grad) so that
+            # x_t = (1-sigma)*x_0 + sigma*eps is a realistic input for any t.
             if teacher is not None:
-                teacher_block_data = [{} for _ in range(len(teacher.transformer_blocks))]
-                teacher_hooks = []
+                x_0 = teacher_generate_x0(
+                    teacher, scheduler, enc_hs, pooled,
+                    args.latent_height, args.latent_width,
+                    device, n_steps=args.teacher_steps,
+                )
+            else:
+                # Smoke test: skip teacher, use pure noise as stand-in
+                x_0 = torch.randn(B, 16, 32, 32, device=device, dtype=torch.bfloat16)
 
-                for _i, _blk in enumerate(teacher.transformer_blocks):
-                    _cap = teacher_block_data[_i]
+            # Amortize: K (x_t, t) pairs per x_0
+            pure_block_phase = step < args.pure_block_steps
+            K = args.amortize_k
+            total_loss = torch.tensor(0.0, device=device)
+            final_loss = torch.tensor(0.0, device=device)
+            block_loss = torch.tensor(0.0, device=device)
 
-                    def _make_pre(_c):
-                        def _hook(_m, _args, _kwargs):
-                            _c['hs_in']     = _kwargs.get('hidden_states')
-                            _c['enc_hs_in'] = _kwargs.get('encoder_hidden_states')
-                            _c['temb_in']   = _kwargs.get('temb')
-                        return _hook
+            for _ in range(K):
+                timestep = torch.randint(1, 999, (B,), device=device)
+                sigma = (timestep.float() / 1000).view(B, 1, 1, 1)
+                eps = torch.randn_like(x_0)
+                x_t = ((1 - sigma) * x_0 + sigma * eps).to(x_0.dtype)
 
-                    def _make_post(_c):
-                        def _hook(_m, _inp, _out):
-                            _c['enc_hs_out'] = _out[0].detach() if _out[0] is not None else None
-                            _c['hs_out']     = _out[1].detach()
-                        return _hook
+                # Teacher forward (no grad): capture block inputs/outputs on realistic x_t
+                if teacher is not None:
+                    teacher_block_data = [{} for _ in range(len(teacher.transformer_blocks))]
+                    teacher_hooks = []
 
-                    teacher_hooks.append(_blk.register_forward_pre_hook(_make_pre(_cap), with_kwargs=True))
-                    teacher_hooks.append(_blk.register_forward_hook(_make_post(_cap)))
+                    for _i, _blk in enumerate(teacher.transformer_blocks):
+                        _cap = teacher_block_data[_i]
 
-                with torch.no_grad():
-                    teacher_out = teacher(
-                        hidden_states=hidden_states,
+                        def _make_pre(_c):
+                            def _hook(_m, _args, _kwargs):
+                                _c['hs_in']     = _kwargs.get('hidden_states')
+                                _c['enc_hs_in'] = _kwargs.get('encoder_hidden_states')
+                                _c['temb_in']   = _kwargs.get('temb')
+                            return _hook
+
+                        def _make_post(_c):
+                            def _hook(_m, _inp, _out):
+                                _c['enc_hs_out'] = _out[0].detach() if _out[0] is not None else None
+                                _c['hs_out']     = _out[1].detach()
+                            return _hook
+
+                        teacher_hooks.append(_blk.register_forward_pre_hook(_make_pre(_cap), with_kwargs=True))
+                        teacher_hooks.append(_blk.register_forward_hook(_make_post(_cap)))
+
+                    with torch.no_grad():
+                        teacher_out = teacher(
+                            hidden_states=x_t,
+                            encoder_hidden_states=enc_hs,
+                            pooled_projections=pooled,
+                            timestep=timestep,
+                        ).sample.detach()
+
+                    for _h in teacher_hooks:
+                        _h.remove()
+                else:
+                    teacher_out = torch.randn_like(x_0)
+                    teacher_block_data = []
+
+                # Block loss: student blocks on teacher's captured pre-block states
+                blk_loss_k = (
+                    teacher_forced_block_loss(raw_student, teacher_block_data, device)
+                    if teacher_block_data else torch.tensor(0.0, device=device)
+                )
+                block_loss = block_loss + blk_loss_k.detach() / K
+
+                # Final loss: end-to-end student vs teacher output
+                # Skip during pure_block_phase to avoid gradient conflict.
+                if pure_block_phase:
+                    fin_loss_k = torch.tensor(0.0, device=device)
+                    step_loss = blk_loss_k
+                else:
+                    student_out = raw_student(
+                        hidden_states=x_t,
                         encoder_hidden_states=enc_hs,
                         pooled_projections=pooled,
                         timestep=timestep,
-                    ).sample.detach()
+                    ).sample
+                    fin_loss_k = _mse_mae(student_out, teacher_out)
+                    final_loss = final_loss + fin_loss_k.detach() / K
+                    step_loss = fin_loss_k + args.block_loss_weight * blk_loss_k
 
-                for _h in teacher_hooks:
-                    _h.remove()
-            else:
-                # Smoke test: no teacher, skip block loss
-                teacher_out = torch.randn_like(hidden_states)
-                teacher_block_data = []
-
-            # --- Block loss: full student block on teacher's pre-block states (with grad) ---
-            block_loss = (
-                teacher_forced_block_loss(raw_student, teacher_block_data, device)
-                if teacher_block_data else torch.tensor(0.0, device=device)
-            )
-
-            # --- Student forward for final loss ---
-            # During pure_block_steps, skip the student forward entirely: it
-            # creates gradient conflict (PoM receives two signals on different
-            # inputs — teacher-normalised states vs student-accumulated states).
-            # Once block_loss is low enough, final_loss adds the end-to-end signal.
-            pure_block_phase = step < args.pure_block_steps
-            if pure_block_phase:
-                final_loss = torch.tensor(0.0, device=device)
-                total_loss = block_loss
-            else:
-                student_out = raw_student(
-                    hidden_states=hidden_states,
-                    encoder_hidden_states=enc_hs,
-                    pooled_projections=pooled,
-                    timestep=timestep,
-                ).sample
-                final_loss = _mse_mae(student_out, teacher_out)
-                total_loss = final_loss + args.block_loss_weight * block_loss
-            (total_loss / args.grad_accum_steps).backward()
+                (step_loss / (K * args.grad_accum_steps)).backward()
+                total_loss = total_loss + step_loss.detach() / K
 
             if (step + 1) % args.grad_accum_steps == 0:
                 if dist.is_initialized():
