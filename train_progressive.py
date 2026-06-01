@@ -398,7 +398,8 @@ def main():
 
                 if teacher is not None:
                     t_frac = 1.0 - timestep.float().mean().item() / 1000.0
-                    n_steps = max(1, round(args.teacher_steps_max * t_frac))
+                    #n_steps = max(1, round(args.teacher_steps_max * t_frac))
+                    n_steps = args.teacher_steps_max
                     teacher_steps_sum += n_steps
                     x_0 = teacher_generate_x0(
                         teacher, scheduler, enc_hs, pooled,
@@ -412,29 +413,57 @@ def main():
                 eps = torch.randn_like(x_0)
                 x_t = ((1 - sigma) * x_0 + sigma * eps).to(x_0.dtype)
 
-                # Teacher forward with hooks to capture block states
+                # Determine first PoM block index (stable within amortize_k loop)
+                n_pom = raw_student.config.n_pom_blocks or num_layers
+                first_pom_idx = num_layers - n_pom
+
+                # Teacher forward — hook count depends on block_loss_weight:
+                #   > 0: all 24 blocks hooked for block distillation
+                #   == 0, first_pom_idx > 0: single post-hook on boundary block only
+                #   == 0, first_pom_idx == 0: no hooks (all blocks are PoM)
                 if teacher is not None:
-                    teacher_block_data = [{} for _ in range(len(teacher.transformer_blocks))]
                     teacher_hooks = []
 
-                    for _i, _blk in enumerate(teacher.transformer_blocks):
-                        _cap = teacher_block_data[_i]
+                    if args.block_loss_weight > 0:
+                        teacher_block_data = [{} for _ in range(len(teacher.transformer_blocks))]
+                        for _i, _blk in enumerate(teacher.transformer_blocks):
+                            _cap = teacher_block_data[_i]
 
-                        def _make_pre(_c):
-                            def _hook(_m, _args, _kwargs):
-                                _c["hs_in"]     = _kwargs.get("hidden_states")
-                                _c["enc_hs_in"] = _kwargs.get("encoder_hidden_states")
-                                _c["temb_in"]   = _kwargs.get("temb")
-                            return _hook
+                            def _make_pre(_c):
+                                def _hook(_m, _args, _kwargs):
+                                    _c["hs_in"]     = _kwargs.get("hidden_states")
+                                    _c["enc_hs_in"] = _kwargs.get("encoder_hidden_states")
+                                    _c["temb_in"]   = _kwargs.get("temb")
+                                return _hook
 
-                        def _make_post(_c):
+                            def _make_post(_c):
+                                def _hook(_m, _inp, _out):
+                                    _c["enc_hs_out"] = _out[0].detach() if _out[0] is not None else None
+                                    _c["hs_out"]     = _out[1].detach()
+                                return _hook
+
+                            teacher_hooks.append(_blk.register_forward_pre_hook(_make_pre(_cap), with_kwargs=True))
+                            teacher_hooks.append(_blk.register_forward_hook(_make_post(_cap)))
+
+                    elif first_pom_idx > 0:
+                        # Only need the boundary state at the attention/PoM transition
+                        teacher_block_data = [None] * len(teacher.transformer_blocks)
+                        _boundary_cap = {}
+                        teacher_block_data[first_pom_idx - 1] = _boundary_cap
+
+                        def _make_boundary_post(_c):
                             def _hook(_m, _inp, _out):
                                 _c["enc_hs_out"] = _out[0].detach() if _out[0] is not None else None
                                 _c["hs_out"]     = _out[1].detach()
                             return _hook
 
-                        teacher_hooks.append(_blk.register_forward_pre_hook(_make_pre(_cap), with_kwargs=True))
-                        teacher_hooks.append(_blk.register_forward_hook(_make_post(_cap)))
+                        teacher_hooks.append(
+                            teacher.transformer_blocks[first_pom_idx - 1].register_forward_hook(
+                                _make_boundary_post(_boundary_cap)
+                            )
+                        )
+                    else:
+                        teacher_block_data = []
 
                     with torch.no_grad():
                         teacher_out = teacher(
@@ -450,23 +479,25 @@ def main():
                     teacher_out = torch.randn_like(x_0)
                     teacher_block_data = []
 
-                blk_loss_k = (
-                    teacher_forced_block_loss(raw_student, teacher_block_data, device)
-                    if teacher_block_data else torch.tensor(0.0, device=device)
-                )
+                if args.block_loss_weight > 0 and teacher_block_data:
+                    blk_loss_k = teacher_forced_block_loss(raw_student, teacher_block_data, device)
+                else:
+                    blk_loss_k = torch.tensor(0.0, device=device)
                 block_loss = block_loss + blk_loss_k.detach() / K
 
                 # Student final pass: use teacher's captured boundary state so we only
                 # run the PoM blocks (+ norm_out + proj_out_lora) with gradients.
                 # Attention blocks 0..first_pom_idx-1 are frozen and identical to the
                 # teacher, so teacher_block_data already holds their exact output.
-                n_pom = raw_student.config.n_pom_blocks or num_layers
-                first_pom_idx = num_layers - n_pom
-
                 if first_pom_idx > 0 and teacher_block_data:
-                    hs_s = teacher_block_data[first_pom_idx - 1]["hs_out"]
-                    enc_hs_s = teacher_block_data[first_pom_idx - 1]["enc_hs_out"]
-                    temb_s = teacher_block_data[0]["temb_in"]
+                    _bnd = teacher_block_data[first_pom_idx - 1]
+                    hs_s = _bnd["hs_out"]
+                    enc_hs_s = _bnd["enc_hs_out"]
+                    if args.block_loss_weight > 0:
+                        temb_s = teacher_block_data[0]["temb_in"]
+                    else:
+                        with torch.no_grad():
+                            temb_s = raw_student.time_text_embed(timestep, pooled).detach()
 
                     for i in range(first_pom_idx, num_layers):
                         enc_hs_s, hs_s = raw_student.transformer_blocks[i](
