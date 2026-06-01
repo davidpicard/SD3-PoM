@@ -21,6 +21,7 @@ Or run locally for a smoke test:
         --smoke_test --n_pom_blocks_start 1 --replacement_step_schedule 2
 """
 import argparse
+import json
 import math
 import os
 import random
@@ -59,8 +60,12 @@ def parse_args():
     p.add_argument("--model_id", default="stabilityai/stable-diffusion-3.5-medium")
     p.add_argument("--embeddings_dir", required=True)
     p.add_argument("--output_dir", required=True)
+    p.add_argument("--resume", action="store_true",
+                   help="Auto-resume from the latest step_XXXXXXX checkpoint in output_dir "
+                        "(no-op on first run). Put this in the Slurm script so requeueing "
+                        "automatically picks up where training left off.")
     p.add_argument("--resume_from", default=None,
-                   help="Resume a progressive-training checkpoint (already has n_pom_blocks set)")
+                   help="Resume from an explicit checkpoint path (loads model, optimizer, step)")
 
     # PoM arch
     p.add_argument("--pom_degree", type=int, default=4)
@@ -131,6 +136,57 @@ def lr_schedule(step: int, warmup_steps: int, max_steps: int, base_lr: float) ->
         return base_lr * step / max(1, warmup_steps)
     progress = (step - warmup_steps) / max(1, max_steps - warmup_steps)
     return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+def find_latest_checkpoint(out_dir: Path) -> Path | None:
+    ckpts = sorted(
+        (p for p in out_dir.glob("step_*") if p.is_dir() and (p / "config.json").exists()),
+        key=lambda p: int(p.name.split("_")[1]),
+    )
+    return ckpts[-1] if ckpts else None
+
+
+def save_checkpoint(model, optimizer, step: int, ckpt_dir: Path) -> None:
+    model.save_pretrained(ckpt_dir)
+    # Keying optimizer state by param name makes it independent of param-group order,
+    # which changes across block replacements (new groups are added incrementally).
+    param_to_name = {id(p): n for n, p in model.named_parameters()}
+    named_state = {
+        param_to_name[id(p)]: {
+            k: v.cpu() if isinstance(v, torch.Tensor) else v
+            for k, v in state.items()
+        }
+        for p, state in optimizer.state.items()
+        if id(p) in param_to_name
+    }
+    torch.save({"named_state": named_state}, ckpt_dir / "optimizer.pt")
+    (ckpt_dir / "train_state.json").write_text(json.dumps({"step": step}))
+
+
+def load_checkpoint_optimizer(opt_data: dict, optimizer, model, device) -> None:
+    """Restore Adam state into optimizer by matching param names, not positions."""
+    named_state = opt_data["named_state"]
+    param_to_name = {id(p): n for n, p in model.named_parameters()}
+    all_params = [p for g in optimizer.param_groups for p in g["params"]]
+
+    new_state: dict = {}
+    for i, p in enumerate(all_params):
+        name = param_to_name.get(id(p))
+        if name and name in named_state:
+            new_state[i] = {
+                k: v.to(device) if isinstance(v, torch.Tensor) else v
+                for k, v in named_state[name].items()
+            }
+
+    pos = 0
+    new_groups = []
+    for g in optimizer.param_groups:
+        ng = {k: v for k, v in g.items() if k != "params"}
+        ng["params"] = list(range(pos, pos + len(g["params"])))
+        new_groups.append(ng)
+        pos += len(g["params"])
+
+    optimizer.load_state_dict({"state": new_state, "param_groups": new_groups})
 
 
 # ---------------------------------------------------------------------------
@@ -311,11 +367,20 @@ def main():
         teacher = None
         scheduler = None
 
-    # --- Student (hybrid: attention + PoM) ---
-    num_layers = 24  # SD3.5 Medium
+    # --- Resolve resume directory ---
+    resume_dir: Path | None = None
     if args.resume_from:
-        print(f"[rank {local_rank}] Resuming from {args.resume_from} ...")
-        raw_student = PomSD3Transformer2DModel.from_pretrained(args.resume_from).to(
+        resume_dir = Path(args.resume_from)
+    elif args.resume:
+        resume_dir = find_latest_checkpoint(out_dir)
+        if resume_dir is None and is_main():
+            print("No checkpoint found in output_dir — starting fresh.")
+
+    # --- Student (hybrid: attention + PoM) ---
+    num_layers = 24  # SD3.5 Medium; overridden below for smoke test / on resume
+    if resume_dir is not None:
+        print(f"[rank {local_rank}] Resuming from {resume_dir} ...")
+        raw_student = PomSD3Transformer2DModel.from_pretrained(resume_dir).to(
             device=device, dtype=torch.bfloat16
         )
     elif not args.smoke_test:
@@ -340,7 +405,8 @@ def main():
             pom_degree=2, pom_expand=2, pom_n_groups=1, pom_n_sel_heads=1,
             lora_rank=4, n_pom_blocks=args.n_pom_blocks_start,
         ).to(device=device, dtype=torch.bfloat16)
-        num_layers = 4
+
+    num_layers = raw_student.config.num_layers  # correct for both resume and smoke test
 
     raw_student.train()
 
@@ -361,9 +427,25 @@ def main():
         pom_params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.999),
     )
 
-    # --- Training loop ---
+    # --- Restore optimizer state and step counter ---
     step = 0
+    if resume_dir is not None:
+        opt_path = resume_dir / "optimizer.pt"
+        if opt_path.exists():
+            load_checkpoint_optimizer(
+                torch.load(opt_path, map_location="cpu"), optimizer, raw_student, device
+            )
+            if is_main():
+                print(f"  Optimizer state restored from {opt_path}")
+        state_path = resume_dir / "train_state.json"
+        if state_path.exists():
+            step = json.loads(state_path.read_text())["step"] + 1
+            if is_main():
+                print(f"  Resuming at step {step}")
+
+    # --- Training loop ---
     epoch = 0
+    start_step = step
     t0 = time.time()
 
     while step < args.max_steps:
@@ -553,11 +635,15 @@ def main():
             n_pom_now = raw_student.config.n_pom_blocks if raw_student.config.n_pom_blocks is not None else num_layers
             if step > 0 and step % args.replacement_step_schedule == 0 and n_pom_now < num_layers:
                 new_block = replace_next_attention_block(raw_student)
-                # Mark new block's PoM+LoRA params as trainable and register with optimizer
+                # pom_fragments uses full model-path prefixes (e.g. ".pom.") but
+                # new_block.named_parameters() gives block-relative names ("pom.se_bias"),
+                # so strip the leading dot for matching here.
+                pom_frags_blk = tuple(f.lstrip(".") for f in pom_fragments)
                 new_pom_params = []
                 for name, param in new_block.named_parameters():
-                    if any(f in name for f in pom_fragments):
-                        param.requires_grad_(True)
+                    is_pom = any(f in name for f in pom_frags_blk)
+                    param.requires_grad_(is_pom)  # freeze norm/ff base, unfreeze pom/lora
+                    if is_pom:
                         new_pom_params.append(param)
                         pom_params.append(param)
                 if new_pom_params:
@@ -580,7 +666,7 @@ def main():
                     "n_pom_blocks": n_pom_now,
                     "lr": lr,
                     "step": step,
-                    "samples_per_sec": (step + 1) * args.batch_size * n_world / elapsed,
+                    "samples_per_sec": (step + 1 - start_step) * args.batch_size * n_world / elapsed,
                 }
                 wandb.log(log, step=step)
                 print(
@@ -592,7 +678,7 @@ def main():
             # --- Checkpointing ---
             if is_main() and step > 0 and step % args.save_every == 0:
                 ckpt_dir = out_dir / f"step_{step:07d}"
-                raw_student.save_pretrained(ckpt_dir)
+                save_checkpoint(raw_student, optimizer, step, ckpt_dir)
                 print(f"Saved checkpoint to {ckpt_dir}")
 
             # --- Image samples ---

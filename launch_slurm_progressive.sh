@@ -21,6 +21,7 @@ srun torchrun \
     --rdzv_backend=c10d \
     --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
     train_progressive.py \
+        --resume \
         --model_id /path/to/models/sd3.5-medium \
         --embeddings_dir /path/to/embeddings \
         --output_dir /path/to/progressive-output \
