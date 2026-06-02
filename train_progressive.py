@@ -21,6 +21,7 @@ Or run locally for a smoke test:
         --smoke_test --n_pom_blocks_start 1 --replacement_step_schedule 2
 """
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -43,12 +44,34 @@ from diffusers import (
 )
 from diffusers.models.attention import JointTransformerBlock
 
-from dataset import EmbeddingDataset
+from dataset import CaptionDataset, EmbeddingDataset, caption_collate_fn
 from pom_sd3 import (
     PomSD3Transformer2DModel,
     build_from_sd3_pretrained,
     replace_next_attention_block,
 )
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def _silence_fd2():
+    """Redirect fd 2 to /dev/null for the duration of the block.
+
+    The fast tokenizer (a Rust extension) writes directly to fd 2, bypassing
+    Python's sys.stderr, so only an OS-level redirect suppresses it.
+    """
+    old_fd = os.dup(2)
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, 2)
+    os.close(devnull)
+    try:
+        yield
+    finally:
+        os.dup2(old_fd, 2)
+        os.close(old_fd)
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +81,12 @@ from pom_sd3 import (
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model_id", default="stabilityai/stable-diffusion-3.5-medium")
-    p.add_argument("--embeddings_dir", required=True)
+    p.add_argument("--embeddings_dir", default=None,
+                   help="Pre-computed embedding shards (enc/pooled .npy). "
+                        "Mutually exclusive with --captions_dir.")
+    p.add_argument("--captions_dir", default=None,
+                   help="Raw caption shards (shard_*.jsonl from download_data.py). "
+                        "Text encoders are run online. Mutually exclusive with --embeddings_dir.")
     p.add_argument("--output_dir", required=True)
     p.add_argument("--resume", action="store_true",
                    help="Auto-resume from the latest step_XXXXXXX checkpoint in output_dir "
@@ -330,6 +358,13 @@ def main():
             mode="offline" if args.wandb_offline else "online",
         )
 
+    # --- Validate data source ---
+    if not args.smoke_test:
+        if args.embeddings_dir and args.captions_dir:
+            raise ValueError("Specify --embeddings_dir OR --captions_dir, not both.")
+        if not args.embeddings_dir and not args.captions_dir:
+            raise ValueError("One of --embeddings_dir or --captions_dir is required.")
+
     # --- Dataset ---
     if args.smoke_test:
         class _SmokeDset(torch.utils.data.Dataset):
@@ -340,13 +375,19 @@ def main():
                     "pooled_projections": torch.randn(2048),
                 }
         dataset = _SmokeDset()
+        collate_fn = None
+    elif args.captions_dir:
+        dataset = CaptionDataset(args.captions_dir)
+        collate_fn = caption_collate_fn
     else:
         dataset = EmbeddingDataset(args.embeddings_dir, args.latent_height, args.latent_width)
+        collate_fn = None
 
     sampler = DistributedSampler(dataset, shuffle=True) if dist.is_initialized() else None
     loader = DataLoader(
         dataset, batch_size=args.batch_size, sampler=sampler,
         shuffle=(sampler is None), num_workers=2, pin_memory=True, drop_last=True,
+        collate_fn=collate_fn,
     )
 
     # --- Teacher (frozen, for x_0 generation + block-state capture) ---
@@ -366,6 +407,20 @@ def main():
     else:
         teacher = None
         scheduler = None
+
+    # --- Text encoders (online caption encoding path) ---
+    if args.captions_dir and not args.smoke_test:
+        print(f"[rank {local_rank}] Loading text encoders ...")
+        _local = Path(args.model_id).exists()
+        text_pipe = StableDiffusion3Pipeline.from_pretrained(
+            args.model_id, transformer=None, vae=None,
+            torch_dtype=torch.bfloat16,
+            local_files_only=_local,
+        ).to(device)
+        for p in text_pipe.parameters():
+            p.requires_grad_(False)
+    else:
+        text_pipe = None
 
     # --- Resolve resume directory ---
     resume_dir: Path | None = None
@@ -461,8 +516,18 @@ def main():
             for pg in optimizer.param_groups:
                 pg["lr"] = lr
 
-            enc_hs = batch["encoder_hidden_states"].to(device=device, dtype=torch.bfloat16)
-            pooled = batch["pooled_projections"].to(device=device, dtype=torch.bfloat16)
+            if text_pipe is not None:
+                with torch.no_grad(), _silence_fd2():
+                    prompt_embeds, _, pooled_embeds, _ = text_pipe.encode_prompt(
+                        prompt=batch["caption"],
+                        prompt_2=batch["caption"],
+                        prompt_3=batch["caption"],
+                    )
+                enc_hs = prompt_embeds.to(dtype=torch.bfloat16)
+                pooled = pooled_embeds.to(dtype=torch.bfloat16)
+            else:
+                enc_hs = batch["encoder_hidden_states"].to(device=device, dtype=torch.bfloat16)
+                pooled = batch["pooled_projections"].to(device=device, dtype=torch.bfloat16)
             B = enc_hs.shape[0]
 
             if random.random() < args.uncond_prob:

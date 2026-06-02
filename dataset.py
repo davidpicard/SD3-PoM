@@ -1,17 +1,26 @@
-"""Dataset of precomputed SD3.5 text embeddings.
+"""Datasets for SD3.5 training.
 
-Storage layout (preferred — supports mmap):
+EmbeddingDataset — pre-computed text embeddings:
     embeddings/
         index.json              # {"shard_00000": N, ...}
         enc/shard_00000.npy    # (N, seq_len, 4096) float16
         pooled/shard_00000.npy # (N, 2048) float16
 
-Legacy layout (npz shards — loads the full shard into RAM, ~27 GB each):
-    embeddings/
-        index.json
-        shard_00000.npz
+    Legacy layout (npz shards — loads the full shard into RAM, ~27 GB each):
+        embeddings/
+            index.json
+            shard_00000.npz
 
-Use migrate_embeddings.py to convert legacy shards to the npy layout.
+    Use migrate_embeddings.py to convert legacy shards to the npy layout.
+
+CaptionDataset — raw captions for online text encoding:
+    captions/
+        shard_00000.jsonl       # one JSON-encoded string per line
+        shard_00001.jsonl
+        ...
+
+    Written by download_data.py. Use with caption_collate_fn and a
+    StableDiffusion3Pipeline (transformer=None, vae=None) to encode online.
 """
 import json
 import warnings
@@ -116,3 +125,49 @@ class EmbeddingDataset(Dataset):
             "pooled_projections": pooled,
             "timestep": torch.randint(0, self.max_timestep, (1,)).item(),
         }
+
+
+class CaptionDataset(Dataset):
+    """Random-access dataset over raw caption shards (shard_XXXXX.jsonl).
+
+    Each shard is loaded into memory on first access and cached; at most two
+    shards are kept in memory at once.  Captions are returned as plain strings
+    and must be encoded online — use caption_collate_fn with the DataLoader.
+    """
+
+    def __init__(self, captions_dir: str | Path):
+        shards = sorted(Path(captions_dir).glob("shard_*.jsonl"))
+        if not shards:
+            raise FileNotFoundError(f"No shard_*.jsonl files in {captions_dir}")
+        self._shards = shards
+        self._cache: dict[int, list[str]] = {}
+        counts = [self._count_lines(s) for s in shards]
+        self._index: list[tuple[int, int]] = [
+            (si, li) for si, n in enumerate(counts) for li in range(n)
+        ]
+        print(f"CaptionDataset: {len(self._index)} captions in {len(shards)} shards")
+
+    @staticmethod
+    def _count_lines(path: Path) -> int:
+        with open(path, encoding="utf-8") as f:
+            return sum(1 for ln in f if ln.strip())
+
+    def _get_shard(self, si: int) -> list[str]:
+        if si not in self._cache:
+            if len(self._cache) > 1:
+                del self._cache[next(iter(self._cache))]
+            with open(self._shards[si], encoding="utf-8") as f:
+                self._cache[si] = [json.loads(ln) for ln in f if ln.strip()]
+        return self._cache[si]
+
+    def __len__(self) -> int:
+        return len(self._index)
+
+    def __getitem__(self, idx: int) -> dict:
+        si, li = self._index[idx]
+        return {"caption": self._get_shard(si)[li]}
+
+
+def caption_collate_fn(batch: list[dict]) -> dict:
+    """Collate CaptionDataset items into a batch with a list of caption strings."""
+    return {"caption": [item["caption"] for item in batch]}
