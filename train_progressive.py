@@ -417,8 +417,9 @@ def main():
             torch_dtype=torch.bfloat16,
             local_files_only=_local,
         ).to(device)
-        for p in text_pipe.parameters():
-            p.requires_grad_(False)
+        for encoder in (text_pipe.text_encoder, text_pipe.text_encoder_2, text_pipe.text_encoder_3):
+            if encoder is not None:
+                encoder.requires_grad_(False)
     else:
         text_pipe = None
 
