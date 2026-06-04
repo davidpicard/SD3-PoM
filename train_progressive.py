@@ -94,9 +94,11 @@ class GPicDataset(torch.utils.data.IterableDataset):
         dataset_dir: str | None = None,
     ):
         from datasets import load_dataset
-        hf_ds = load_dataset(dataset_name, split=split, streaming=True,
-                             trust_remote_code=True,
-                             **({"data_dir": dataset_dir} if dataset_dir else {}))
+        load_kwargs = {"trust_remote_code": True}
+        if dataset_dir:
+            load_kwargs["data_dir"] = dataset_dir
+            load_kwargs["local_files_only"] = True
+        hf_ds = load_dataset(dataset_name, split=split, streaming=True, **load_kwargs)
         if world_size > 1:
             hf_ds = hf_ds.shard(num_shards=world_size, index=rank)
         self._ds = hf_ds
