@@ -38,11 +38,13 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 import wandb
 from diffusers import (
+    AutoencoderKL,
     SD3Transformer2DModel,
     FlowMatchEulerDiscreteScheduler,
     StableDiffusion3Pipeline,
 )
 from diffusers.models.attention import JointTransformerBlock
+from torchvision import transforms
 
 from dataset import CaptionDataset, EmbeddingDataset, caption_collate_fn
 from pom_sd3 import (
@@ -75,6 +77,63 @@ def _silence_fd2():
 
 
 # ---------------------------------------------------------------------------
+# GPic dataset (paired image+caption training)
+# ---------------------------------------------------------------------------
+
+class GPicDataset(torch.utils.data.IterableDataset):
+    """Streams stanford-vision-lab/gpic, preprocesses images, yields (pixel_values, caption)."""
+
+    def __init__(
+        self,
+        dataset_name: str,
+        split: str,
+        image_size: int,
+        rank: int,
+        world_size: int,
+        caption_type: str | None = None,
+        dataset_dir: str | None = None,
+    ):
+        from datasets import load_dataset
+        hf_ds = load_dataset(dataset_name, split=split, streaming=True,
+                             trust_remote_code=True,
+                             **({"data_dir": dataset_dir} if dataset_dir else {}))
+        if world_size > 1:
+            hf_ds = hf_ds.shard(num_shards=world_size, index=rank)
+        self._ds = hf_ds
+        self._caption_type = caption_type if caption_type != "all" else None
+        self._preprocess = transforms.Compose([
+            transforms.Resize(image_size,
+                              interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.CenterCrop(image_size),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+        ])
+
+    def __iter__(self):
+        for sample in self._ds:
+            if self._caption_type and sample.get("caption_type") != self._caption_type:
+                continue
+            try:
+                img = sample["image"].convert("RGB")
+            except Exception:
+                continue
+            caption = sample.get("caption", "")
+            if not caption:
+                continue
+            yield {
+                "pixel_values": self._preprocess(img),
+                "caption": caption,
+            }
+
+
+def gpic_collate(batch: list[dict]) -> dict:
+    return {
+        "pixel_values": torch.stack([b["pixel_values"] for b in batch]),
+        "caption": [b["caption"] for b in batch],
+    }
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -83,10 +142,22 @@ def parse_args():
     p.add_argument("--model_id", default="stabilityai/stable-diffusion-3.5-medium")
     p.add_argument("--embeddings_dir", default=None,
                    help="Pre-computed embedding shards (enc/pooled .npy). "
-                        "Mutually exclusive with --captions_dir.")
+                        "Mutually exclusive with --captions_dir and --dataset_name.")
     p.add_argument("--captions_dir", default=None,
                    help="Raw caption shards (shard_*.jsonl from download_data.py). "
-                        "Text encoders are run online. Mutually exclusive with --embeddings_dir.")
+                        "Text encoders are run online. Mutually exclusive with --embeddings_dir and --dataset_name.")
+    p.add_argument("--dataset_name", default=None,
+                   help="HF dataset for paired image+caption training (e.g. stanford-vision-lab/gpic). "
+                        "Images are VAE-encoded on-the-fly; teacher is only used when --block_loss_weight > 0. "
+                        "Mutually exclusive with --embeddings_dir / --captions_dir.")
+    p.add_argument("--dataset_dir", default=None,
+                   help="Local directory for the HF dataset (passed as data_dir to load_dataset).")
+    p.add_argument("--dataset_split", default="train")
+    p.add_argument("--caption_type", default="all",
+                   choices=["all", "tag", "short", "medium", "long"],
+                   help="Filter gpic captions by type (default: use all types).")
+    p.add_argument("--image_size", type=int, default=512,
+                   help="Training resolution for gpic images (should match --latent_height/width × 8).")
     p.add_argument("--output_dir", required=True)
     p.add_argument("--resume", action="store_true",
                    help="Auto-resume from the latest step_XXXXXXX checkpoint in output_dir "
@@ -345,6 +416,8 @@ def main():
     args = parse_args()
     local_rank = setup_ddp()
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    rank = dist.get_rank() if dist.is_initialized() else 0
 
     out_dir = Path(args.output_dir)
     if is_main():
@@ -360,35 +433,67 @@ def main():
 
     # --- Validate data source ---
     if not args.smoke_test:
-        if args.embeddings_dir and args.captions_dir:
-            raise ValueError("Specify --embeddings_dir OR --captions_dir, not both.")
-        if not args.embeddings_dir and not args.captions_dir:
-            raise ValueError("One of --embeddings_dir or --captions_dir is required.")
+        sources = sum(bool(x) for x in [args.embeddings_dir, args.captions_dir, args.dataset_name])
+        if sources > 1:
+            raise ValueError("Specify exactly one of --embeddings_dir, --captions_dir, --dataset_name.")
+        if sources == 0:
+            raise ValueError("One of --embeddings_dir, --captions_dir, or --dataset_name is required.")
 
     # --- Dataset ---
     if args.smoke_test:
-        class _SmokeDset(torch.utils.data.Dataset):
-            def __len__(self): return 16
-            def __getitem__(self, i):
-                return {
-                    "encoder_hidden_states": torch.randn(8, 4096),
-                    "pooled_projections": torch.randn(2048),
-                }
-        dataset = _SmokeDset()
-        collate_fn = None
+        if args.dataset_name:
+            # gpic-compatible smoke dataset: yields pixel_values + caption
+            class _SmokeDset(torch.utils.data.IterableDataset):
+                def __iter__(self):
+                    for _ in range(16):
+                        yield {
+                            "pixel_values": torch.randn(3, args.image_size, args.image_size),
+                            "caption": "a test image",
+                        }
+            dataset = _SmokeDset()
+            collate_fn = gpic_collate
+        else:
+            class _SmokeDset(torch.utils.data.Dataset):
+                def __len__(self): return 16
+                def __getitem__(self, i):
+                    return {
+                        "encoder_hidden_states": torch.randn(8, 4096),
+                        "pooled_projections": torch.randn(2048),
+                    }
+            dataset = _SmokeDset()
+            collate_fn = None
     elif args.captions_dir:
         dataset = CaptionDataset(args.captions_dir)
         collate_fn = caption_collate_fn
+    elif args.dataset_name:
+        dataset = GPicDataset(
+            dataset_name=args.dataset_name,
+            split=args.dataset_split,
+            image_size=args.image_size,
+            rank=rank,
+            world_size=world_size,
+            caption_type=args.caption_type,
+            dataset_dir=args.dataset_dir,
+        )
+        collate_fn = gpic_collate
     else:
         dataset = EmbeddingDataset(args.embeddings_dir, args.latent_height, args.latent_width)
         collate_fn = None
 
-    sampler = DistributedSampler(dataset, shuffle=True) if dist.is_initialized() else None
-    loader = DataLoader(
-        dataset, batch_size=args.batch_size, sampler=sampler,
-        shuffle=(sampler is None), num_workers=2, pin_memory=True, drop_last=True,
-        collate_fn=collate_fn,
-    )
+    if args.dataset_name:
+        # IterableDataset: sharding is handled internally, no DistributedSampler
+        sampler = None
+        loader = DataLoader(
+            dataset, batch_size=args.batch_size, num_workers=0 if args.smoke_test else 4,
+            pin_memory=not args.smoke_test, collate_fn=collate_fn,
+        )
+    else:
+        sampler = DistributedSampler(dataset, shuffle=True) if dist.is_initialized() else None
+        loader = DataLoader(
+            dataset, batch_size=args.batch_size, sampler=sampler,
+            shuffle=(sampler is None), num_workers=2, pin_memory=True, drop_last=True,
+            collate_fn=collate_fn,
+        )
 
     # --- Teacher (frozen, for x_0 generation + block-state capture) ---
     if not args.smoke_test:
@@ -408,8 +513,21 @@ def main():
         teacher = None
         scheduler = None
 
+    # --- VAE (gpic paired-data path) ---
+    if args.dataset_name and not args.smoke_test:
+        print(f"[rank {local_rank}] Loading VAE ...")
+        vae = AutoencoderKL.from_pretrained(
+            args.model_id, subfolder="vae",
+            torch_dtype=torch.bfloat16, local_files_only=_local,
+        ).to(device)
+        for p in vae.parameters():
+            p.requires_grad_(False)
+        vae.eval()
+    else:
+        vae = None
+
     # --- Text encoders (online caption encoding path) ---
-    if args.captions_dir and not args.smoke_test:
+    if (args.captions_dir or args.dataset_name) and not args.smoke_test:
         print(f"[rank {local_rank}] Loading text encoders ...")
         _local = Path(args.model_id).exists()
         text_pipe = StableDiffusion3Pipeline.from_pretrained(
@@ -531,6 +649,16 @@ def main():
                 pooled = batch["pooled_projections"].to(device=device, dtype=torch.bfloat16)
             B = enc_hs.shape[0]
 
+            # VAE-encode real images once; reuse across all K amortize passes
+            if vae is not None:
+                with torch.no_grad():
+                    latents = vae.encode(
+                        batch["pixel_values"].to(device=device, dtype=torch.bfloat16)
+                    ).latent_dist.sample()
+                    x_0_real = (latents - vae.config.shift_factor) * vae.config.scaling_factor
+            else:
+                x_0_real = None
+
             if random.random() < args.uncond_prob:
                 enc_hs = torch.zeros_like(enc_hs)
                 pooled = torch.zeros_like(pooled)
@@ -544,7 +672,10 @@ def main():
             for _ in range(K):
                 timestep = torch.randint(1, 999, (B,), device=device)
 
-                if teacher is not None:
+                # x_0 source: real image latent (gpic) or teacher reverse diffusion
+                if x_0_real is not None:
+                    x_0 = x_0_real
+                elif teacher is not None:
                     t_frac = 1.0 - timestep.float().mean().item() / 1000.0
                     #n_steps = max(1, round(args.teacher_steps_max * t_frac))
                     n_steps = args.teacher_steps_max
@@ -565,11 +696,13 @@ def main():
                 n_pom = raw_student.config.n_pom_blocks or num_layers
                 first_pom_idx = num_layers - n_pom
 
-                # Teacher forward — hook count depends on block_loss_weight:
+                # Teacher forward — skip entirely when using real images with no block loss.
+                # Hook count otherwise depends on block_loss_weight:
                 #   > 0: all 24 blocks hooked for block distillation
                 #   == 0, first_pom_idx > 0: single post-hook on boundary block only
                 #   == 0, first_pom_idx == 0: no hooks (all blocks are PoM)
-                if teacher is not None:
+                skip_teacher = (x_0_real is not None) and (args.block_loss_weight == 0)
+                if teacher is not None and not skip_teacher:
                     teacher_hooks = []
 
                     if args.block_loss_weight > 0:
@@ -624,7 +757,8 @@ def main():
                     for _h in teacher_hooks:
                         _h.remove()
                 else:
-                    teacher_out = torch.randn_like(x_0)
+                    # smoke test or gpic with block_loss_weight==0 — no teacher needed
+                    teacher_out = None
                     teacher_block_data = []
 
                 if args.block_loss_weight > 0 and teacher_block_data:
@@ -679,7 +813,12 @@ def main():
                         timestep=timestep,
                     ).sample
 
-                fin_loss_k = _mse_mae(student_out, teacher_out)
+                if x_0_real is not None:
+                    # gpic mode: flow-matching loss against real VAE target
+                    v_target = (eps - x_0).to(student_out.dtype)
+                    fin_loss_k = _mse_mae(student_out, v_target)
+                else:
+                    fin_loss_k = _mse_mae(student_out, teacher_out)
                 final_loss = final_loss + fin_loss_k.detach() / K
 
                 step_loss = fin_loss_k + args.block_loss_weight * blk_loss_k
@@ -728,7 +867,7 @@ def main():
                     "loss": total_loss.item(),
                     "final_loss": final_loss.item(),
                     "block_loss": block_loss.item(),
-                    "teacher_steps_avg": teacher_steps_sum / K if teacher is not None else 0,
+                    "teacher_steps_avg": teacher_steps_sum / K if teacher_steps_sum > 0 else 0,
                     "n_pom_blocks": n_pom_now,
                     "lr": lr,
                     "step": step,
