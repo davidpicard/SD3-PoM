@@ -146,10 +146,16 @@ class GPicDataset(torch.utils.data.IterableDataset):
         caption_type: str | None = None,
         dataset_dir: str | None = None,
     ):
-        from datasets import load_dataset
+        from datasets import load_dataset, Value
         if dataset_dir:
-            # Load directly from the local directory; avoids any Hub interaction.
             hf_ds = load_dataset(dataset_dir, split=split, streaming=True)
+            # Local parquet stores images as 'jpg' or 'png' bytes; the dataset
+            # metadata declares 'jpg: Image' which fails to cast from null-type
+            # rows (where the image is PNG). Cast both to binary so HF datasets
+            # doesn't invoke the Image decoder.
+            for _col in ('jpg', 'png'):
+                if _col in hf_ds.features:
+                    hf_ds = hf_ds.cast_column(_col, Value('binary'))
         else:
             hf_ds = load_dataset(dataset_name, split=split, streaming=True)
         if world_size > 1:
@@ -166,13 +172,32 @@ class GPicDataset(torch.utils.data.IterableDataset):
 
     def __iter__(self):
         for sample in self._ds:
-            if self._caption_type and sample.get("caption_type") != self._caption_type:
+            # Hub-streamed: 'image' is a decoded PIL image, metadata is flat.
+            # Local parquet: images are raw bytes in 'jpg'/'png', metadata is
+            # nested under the 'json' struct.
+            if "image" in sample:
+                try:
+                    img = sample["image"].convert("RGB")
+                except Exception:
+                    continue
+                caption_type = sample.get("caption_type")
+                caption = sample.get("caption", "")
+            else:
+                raw = sample.get("jpg") or sample.get("png")
+                if not raw:
+                    continue
+                try:
+                    from io import BytesIO
+                    from PIL import Image as PILImage
+                    img = PILImage.open(BytesIO(raw)).convert("RGB")
+                except Exception:
+                    continue
+                meta = sample.get("json") or {}
+                caption_type = meta.get("caption_type")
+                caption = meta.get("caption", "")
+
+            if self._caption_type and caption_type != self._caption_type:
                 continue
-            try:
-                img = sample["image"].convert("RGB")
-            except Exception:
-                continue
-            caption = sample.get("caption", "")
             if not caption:
                 continue
             yield {
