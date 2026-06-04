@@ -93,8 +93,10 @@ class GPicDataset(torch.utils.data.IterableDataset):
         caption_type: str | None = None,
         dataset_dir: str | None = None,
     ):
+        if dataset_dir:
+            os.environ.setdefault("HF_HUB_OFFLINE", "1")
         from datasets import load_dataset
-        load_kwargs = {"trust_remote_code": True}
+        load_kwargs = {}
         if dataset_dir:
             load_kwargs["data_dir"] = dataset_dir
             load_kwargs["local_files_only"] = True
