@@ -134,7 +134,14 @@ def load_checkpoint_optimizer(opt_data: dict, optimizer, model, device) -> None:
 # ---------------------------------------------------------------------------
 
 class GPicDataset(torch.utils.data.IterableDataset):
-    """Streams stanford-vision-lab/gpic, preprocesses images, yields (pixel_values, caption)."""
+    """Streams stanford-vision-lab/gpic, preprocesses images, yields (pixel_values, caption).
+
+    Two backends:
+    - Local (dataset_dir set): reads WebDataset tar shards directly from disk.
+      Each tar contains paired <hash>.json + <hash>.jpg/png files.
+      Shards are distributed across ranks by round-robin.
+    - Hub (dataset_dir None): HF datasets streaming from the Hub.
+    """
 
     def __init__(
         self,
@@ -146,21 +153,6 @@ class GPicDataset(torch.utils.data.IterableDataset):
         caption_type: str | None = None,
         dataset_dir: str | None = None,
     ):
-        from datasets import load_dataset, Value
-        if dataset_dir:
-            hf_ds = load_dataset(dataset_dir, split=split, streaming=True)
-            # Local parquet stores images as 'jpg' or 'png' bytes; the dataset
-            # metadata declares 'jpg: Image' which fails to cast from null-type
-            # rows (where the image is PNG). Cast both to binary so HF datasets
-            # doesn't invoke the Image decoder.
-            for _col in ('jpg', 'png'):
-                if _col in hf_ds.features:
-                    hf_ds = hf_ds.cast_column(_col, Value('binary'))
-        else:
-            hf_ds = load_dataset(dataset_name, split=split, streaming=True)
-        if world_size > 1:
-            hf_ds = hf_ds.shard(num_shards=world_size, index=rank)
-        self._ds = hf_ds
         self._caption_type = caption_type if caption_type != "all" else None
         self._preprocess = transforms.Compose([
             transforms.Resize(image_size,
@@ -170,40 +162,82 @@ class GPicDataset(torch.utils.data.IterableDataset):
             transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
         ])
 
+        if dataset_dir:
+            import glob as _glob
+            all_tars = sorted(_glob.glob(os.path.join(dataset_dir, split, "*.tar")))
+            if not all_tars:
+                raise FileNotFoundError(
+                    f"No .tar shards found in {os.path.join(dataset_dir, split)}"
+                )
+            # Distribute shards across DDP ranks (round-robin)
+            self._tar_files = all_tars[rank::world_size]
+            self._ds = None
+        else:
+            from datasets import load_dataset
+            hf_ds = load_dataset(dataset_name, split=split, streaming=True)
+            if world_size > 1:
+                hf_ds = hf_ds.shard(num_shards=world_size, index=rank)
+            self._ds = hf_ds
+            self._tar_files = None
+
     def __iter__(self):
-        for sample in self._ds:
-            # Hub-streamed: 'image' is a decoded PIL image, metadata is flat.
-            # Local parquet: images are raw bytes in 'jpg'/'png', metadata is
-            # nested under the 'json' struct.
-            if "image" in sample:
+        if self._tar_files is not None:
+            import tarfile
+            import json as _json
+            from io import BytesIO
+            from PIL import Image as PILImage
+            for tar_path in self._tar_files:
+                try:
+                    pending: dict = {}
+                    with tarfile.open(tar_path, "r:") as tf:
+                        for member in tf:
+                            if not member.isfile() or "." not in member.name:
+                                continue
+                            base, ext = member.name.rsplit(".", 1)
+                            f = tf.extractfile(member)
+                            if f is None:
+                                continue
+                            data = f.read()
+                            entry = pending.setdefault(base, {})
+                            if ext == "json":
+                                entry["json"] = data
+                            elif ext in ("jpg", "jpeg", "png"):
+                                entry["img"] = data
+                            if "json" in entry and "img" in entry:
+                                del pending[base]
+                                try:
+                                    meta = _json.loads(entry["json"])
+                                    img = PILImage.open(BytesIO(entry["img"])).convert("RGB")
+                                except Exception:
+                                    continue
+                                caption_type = meta.get("caption_type")
+                                caption = meta.get("caption", "")
+                                if self._caption_type and caption_type != self._caption_type:
+                                    continue
+                                if not caption:
+                                    continue
+                                yield {
+                                    "pixel_values": self._preprocess(img),
+                                    "caption": caption,
+                                }
+                except Exception:
+                    continue
+        else:
+            for sample in self._ds:
+                # Hub-streamed: 'image' is a decoded PIL image, metadata is flat
                 try:
                     img = sample["image"].convert("RGB")
                 except Exception:
                     continue
-                caption_type = sample.get("caption_type")
                 caption = sample.get("caption", "")
-            else:
-                raw = sample.get("jpg") or sample.get("png")
-                if not raw:
+                if not caption:
                     continue
-                try:
-                    from io import BytesIO
-                    from PIL import Image as PILImage
-                    img = PILImage.open(BytesIO(raw)).convert("RGB")
-                except Exception:
+                if self._caption_type and sample.get("caption_type") != self._caption_type:
                     continue
-                meta = sample.get("json") or {}
-                caption_type = meta.get("caption_type")
-                caption = meta.get("caption", "")
-
-            if self._caption_type and caption_type != self._caption_type:
-                continue
-            if not caption:
-                continue
-            yield {
-                "pixel_values": self._preprocess(img),
-                "caption": caption,
-            }
+                yield {
+                    "pixel_values": self._preprocess(img),
+                    "caption": caption,
+                }
 
 
 def gpic_collate(batch: list[dict]) -> dict:
