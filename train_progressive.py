@@ -27,6 +27,7 @@ import math
 import os
 import random
 import shutil
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -63,15 +64,22 @@ def _silence_fd2():
     """Redirect fd 2 to /dev/null for the duration of the block.
 
     The fast tokenizer (a Rust extension) writes directly to fd 2, bypassing
-    Python's sys.stderr, so only an OS-level redirect suppresses it.
+    Python's sys.stderr.  Python's own logging also buffers to sys.stderr, so
+    we replace sys.stderr with a devnull file object as well, then flush before
+    restoring to prevent buffered messages from escaping after the redirect.
     """
     old_fd = os.dup(2)
-    devnull = os.open(os.devnull, os.O_WRONLY)
-    os.dup2(devnull, 2)
-    os.close(devnull)
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull_fd, 2)
+    os.close(devnull_fd)
+    old_stderr = sys.stderr
+    sys.stderr = open(os.devnull, "w")
     try:
         yield
     finally:
+        sys.stderr.flush()
+        sys.stderr.close()
+        sys.stderr = old_stderr
         os.dup2(old_fd, 2)
         os.close(old_fd)
 
