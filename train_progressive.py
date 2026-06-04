@@ -93,14 +93,12 @@ class GPicDataset(torch.utils.data.IterableDataset):
         caption_type: str | None = None,
         dataset_dir: str | None = None,
     ):
-        if dataset_dir:
-            os.environ.setdefault("HF_HUB_OFFLINE", "1")
         from datasets import load_dataset
-        load_kwargs = {}
         if dataset_dir:
-            load_kwargs["data_dir"] = dataset_dir
-            load_kwargs["local_files_only"] = True
-        hf_ds = load_dataset(dataset_name, split=split, streaming=True, **load_kwargs)
+            # Load directly from the local directory; avoids any Hub interaction.
+            hf_ds = load_dataset(dataset_dir, split=split, streaming=True)
+        else:
+            hf_ds = load_dataset(dataset_name, split=split, streaming=True)
         if world_size > 1:
             hf_ds = hf_ds.shard(num_shards=world_size, index=rank)
         self._ds = hf_ds
