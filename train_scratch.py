@@ -349,42 +349,65 @@ def gpic_collate(batch: list[dict]) -> dict:
 # ---------------------------------------------------------------------------
 
 SAMPLE_PROMPTS = [
-    "a red fox running through autumn leaves",
-    "a mountain landscape at sunrise with snow-capped peaks",
-    "a portrait of a young woman with curly hair, oil painting",
-    "a futuristic city skyline at night, neon reflections",
-    "a close-up of a blooming cherry blossom branch",
-    "a wooden cabin in a snowy pine forest",
-    "a child blowing dandelion seeds in a summer meadow",
-    "a surrealist painting of melting clocks in a desert",
+    "a serene mountain landscape at sunrise, photorealistic",
+    "a cyberpunk city at night, neon lights reflecting on wet streets",
+    "a portrait of a fox in a business suit, oil painting",
+    "abstract colorful geometric shapes, vibrant, high contrast",
+    "an astronaut floating in space, Earth visible in the background",
+    "a cozy library with warm lighting and shelves full of books",
+    "a dragon perched on a medieval castle tower, fantasy art",
+    "a bowl of ramen with steam rising, food photography",
+    "a watercolor painting of a Venice canal at dusk",
+    "a robot tending to a flower garden, whimsical illustration",
+    "dense rainforest with rays of sunlight piercing the canopy",
+    "a black and white portrait of an elderly woman, cinematic",
+    "a futuristic space station interior, hard sci-fi concept art",
+    "cherry blossom trees along a river in spring, Japan",
+    "a close-up of a honeybee on a sunflower, macro photography",
+    "a surrealist painting of melting clocks in a desert landscape",
+    "a Viking longship on a stormy sea, dramatic lighting",
+    "a bustling street market in Marrakech, golden hour",
+    "an Art Deco poster of a luxury ocean liner",
+    "a snowy owl in flight against a pale winter sky",
+    "an underwater coral reef teeming with colorful fish",
+    "a steampunk airship over a Victorian city, detailed illustration",
+    "a minimalist ink drawing of a mountain range",
+    "a wolf howling at the full moon in a pine forest, night",
+    "a child blowing dandelion seeds in a summer meadow, soft focus",
 ]
 
 
-@torch.no_grad()
-def generate_samples(model, model_id: str, step: int, device, num_prompts: int = 4):
-    model_path = Path(model_id)
-    if not (model_path / "vae").exists():
-        print(f"  Skipping samples at step {step}: VAE not found in {model_id}")
+def generate_samples(model, vae, text_pipe, step: int, device, num_prompts: int = 4):
+    if text_pipe is None or vae is None:
         return
-    print(f"Generating sample images at step {step} ...")
-    pipe = StableDiffusion3Pipeline.from_pretrained(
-        model_id, transformer=None, local_files_only=model_path.exists(),
-    ).to(device=device, dtype=torch.bfloat16)
-    pipe.transformer = model
-    pipe.set_progress_bar_config(disable=True)
-    tmpdir = tempfile.mkdtemp()
+    if is_main():
+        print(f"Generating sample images at step {step} ...")
+    # All ranks must participate: the FSDP model.forward() is a collective.
+    # We temporarily attach transformer and vae so the pipeline can run.
+    text_pipe.transformer = model
+    text_pipe.vae = vae
+    text_pipe.set_progress_bar_config(disable=True)
+    tmpdir = tempfile.mkdtemp() if is_main() else None
     try:
-        images = []
         for i, prompt in enumerate(SAMPLE_PROMPTS[:num_prompts]):
-            img = pipe(prompt, num_inference_steps=28, guidance_scale=4.0).images[0]
-            path = os.path.join(tmpdir, f"{i:03d}.jpg")
-            img.save(path, format="JPEG", quality=85)
-            images.append(wandb.Image(path, caption=prompt))
-        del pipe
-        torch.cuda.empty_cache()
-        wandb.log({"samples": images}, step=step)
+            with torch.no_grad():
+                img = text_pipe(prompt, num_inference_steps=28, guidance_scale=4.0).images[0]
+            if is_main():
+                path = os.path.join(tmpdir, f"{i:03d}.jpg")
+                img.save(path, format="JPEG", quality=85)
+        if is_main():
+            images = [
+                wandb.Image(os.path.join(tmpdir, f"{i:03d}.jpg"),
+                            caption=SAMPLE_PROMPTS[i])
+                for i in range(min(num_prompts, len(SAMPLE_PROMPTS)))
+            ]
+            wandb.log({"samples": images}, step=step)
     finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        text_pipe.transformer = None
+        text_pipe.vae = None
+        torch.cuda.empty_cache()
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -445,7 +468,7 @@ def parse_args():
     p.add_argument("--log_every", type=int, default=50)
     p.add_argument("--save_every", type=int, default=5_000)
     p.add_argument("--sample_every", type=int, default=5_000)
-    p.add_argument("--num_sample_prompts", type=int, default=8)
+    p.add_argument("--num_sample_prompts", type=int, default=25)
     p.add_argument("--wandb_project", default="sd3-pom-scratch")
     p.add_argument("--wandb_run_name", default=None)
     p.add_argument("--wandb_offline", action="store_true")
@@ -737,9 +760,9 @@ def main():
                 print(f"Saved checkpoint to {ckpt_dir}")
 
         # --- Sample generation ---
-        if is_main() and step > 0 and step % args.sample_every == 0 and not args.smoke_test:
+        if step > 0 and step % args.sample_every == 0 and not args.smoke_test:
             model.eval()
-            generate_samples(model, args.model_id, step, device, args.num_sample_prompts)
+            generate_samples(model, vae, text_pipe, step, device, args.num_sample_prompts)
             model.train()
 
         step += 1
