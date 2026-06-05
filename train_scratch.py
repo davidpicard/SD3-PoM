@@ -47,14 +47,23 @@ from pom_sd3.convert import SD35_MEDIUM_CONFIG
 # ---------------------------------------------------------------------------
 
 @contextlib.contextmanager
-def _silence_fd2():
-    """Redirect fd 2 to /dev/null for the duration of the block.
+def _silence_encoding_noise():
+    """Suppress tokenizer noise during encode_prompt.
 
-    The fast tokenizer (a Rust extension) writes directly to fd 2, bypassing
-    Python's sys.stderr.  Python's own logging also buffers to sys.stderr, so
-    we replace sys.stderr with a devnull file object as well, then flush before
-    restoring to prevent buffered messages from escaping after the redirect.
+    Covers two channels:
+    - fd 2 / sys.stderr: the Rust fast-tokenizer writes directly to fd 2,
+      bypassing Python's logging system.
+    - transformers.tokenization_utils_base logger: emits the
+      "Token indices sequence length is longer than …" warning via Python
+      logging, which wandb captures through its root-logger handler.
+      Raising the level to ERROR for the duration prevents it from
+      appearing in wandb logs.
     """
+    import logging as _logging
+    tok_logger = _logging.getLogger("transformers.tokenization_utils_base")
+    old_level = tok_logger.level
+    tok_logger.setLevel(_logging.ERROR)
+
     old_fd = os.dup(2)
     devnull_fd = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull_fd, 2)
@@ -69,6 +78,7 @@ def _silence_fd2():
         sys.stderr = old_stderr
         os.dup2(old_fd, 2)
         os.close(old_fd)
+        tok_logger.setLevel(old_level)
 
 
 def is_main() -> bool:
@@ -575,7 +585,7 @@ def main():
 
         # --- Encode captions → text embeddings ---
         if text_pipe is not None:
-            with torch.no_grad(), _silence_fd2():
+            with torch.no_grad(), _silence_encoding_noise():
                 enc_hs, _, pooled, _ = text_pipe.encode_prompt(
                     prompt=captions, prompt_2=captions, prompt_3=captions,
                 )
