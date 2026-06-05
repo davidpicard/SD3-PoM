@@ -250,6 +250,10 @@ def parse_args():
     p.add_argument("--pom_expand", type=int, default=2)
     p.add_argument("--pom_n_groups", type=int, default=1)
     p.add_argument("--pom_n_sel_heads", type=int, default=24)
+    p.add_argument("--pom_rope_max_seq_len", type=int, default=8192,
+                   help="Max sequence length for PoMRoPE frequency tables (N_img + N_txt). "
+                        "8192 covers 512px (1024 patches) and 1024px (4096 patches). "
+                        "Use 32768 for 2048px.")
     p.add_argument("--lora_rank", type=int, default=16)
 
     # Progressive replacement
@@ -646,6 +650,7 @@ def main():
             pom_n_sel_heads=args.pom_n_sel_heads,
             lora_rank=args.lora_rank,
             n_pom_blocks=args.n_pom_blocks_start,
+            pom_rope_max_seq_len=args.pom_rope_max_seq_len,
             device=device,
         )
     else:

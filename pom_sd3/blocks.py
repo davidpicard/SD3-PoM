@@ -13,7 +13,7 @@ from diffusers.models.normalization import (
     SD35AdaLayerNormZeroX,
 )
 from diffusers.utils.torch_utils import maybe_allow_in_graph
-from pom import PoM
+from pom.pom_rope import PoMRoPE
 
 
 
@@ -42,6 +42,7 @@ class JointPoMBlock(nn.Module):
         pom_n_groups: int = 1,
         pom_n_sel_heads: int = 1,
         lora_rank: int = 0,
+        pom_rope_max_seq_len: int = 8192,
     ):
         super().__init__()
         self.use_dual_attention = use_dual_attention
@@ -61,22 +62,26 @@ class JointPoMBlock(nn.Module):
             self.norm1_context = AdaLayerNormZero(dim)
 
         # --- PoM: joint image+text mixing (replaces joint Attention) ---
-        self.pom = PoM(
+        self.pom = PoMRoPE(
             dim=dim,
             degree=pom_degree,
             expand=pom_expand,
             n_groups=pom_n_groups,
             n_sel_heads=pom_n_sel_heads,
+            max_seq_len=pom_rope_max_seq_len,
+            rope_2d=False,
         )
 
         # --- PoM: image-only dual mixing (replaces dual Attention attn2) ---
         if use_dual_attention:
-            self.pom2 = PoM(
+            self.pom2 = PoMRoPE(
                 dim=dim,
                 degree=pom_degree,
                 expand=pom_expand,
                 n_groups=pom_n_groups,
                 n_sel_heads=pom_n_sel_heads,
+                max_seq_len=pom_rope_max_seq_len,
+                rope_2d=False,
             )
         else:
             self.pom2 = None
@@ -127,6 +132,16 @@ class JointPoMBlock(nn.Module):
         joint_attention_kwargs: dict[str, Any] | None = None,  # unused, kept for API compat
     ) -> tuple[torch.Tensor, torch.Tensor]:
         n_img = hidden_states.shape[1]
+        n_txt = encoder_hidden_states.shape[1]
+        dev = hidden_states.device
+
+        # 1-D RoPE positions: image tokens at 0..n_img-1 (row-major patch order),
+        # text tokens at n_img..n_img+n_txt-1 (no position overlap between modalities)
+        img_positions = torch.arange(n_img, device=dev, dtype=torch.int64)
+        joint_positions = torch.cat([
+            img_positions,
+            torch.arange(n_img, n_img + n_txt, device=dev, dtype=torch.int64),
+        ])
 
         # --- Normalize image tokens ---
         if self.use_dual_attention:
@@ -148,7 +163,7 @@ class JointPoMBlock(nn.Module):
 
         # --- Joint PoM: mix image + text tokens together ---
         joint = torch.cat([norm_hidden_states, norm_encoder_hidden_states], dim=1)
-        joint_out = self.pom(joint)
+        joint_out = self.pom(joint, positions=joint_positions)
         attn_output = joint_out[:, :n_img]
         context_attn_output = joint_out[:, n_img:]
 
@@ -157,7 +172,7 @@ class JointPoMBlock(nn.Module):
 
         # --- Dual PoM: image-only secondary mixing ---
         if self.use_dual_attention:
-            attn_output2 = self.pom2(norm_hidden_states2)
+            attn_output2 = self.pom2(norm_hidden_states2, positions=img_positions)
             hidden_states = hidden_states + gate_msa2.unsqueeze(1) * attn_output2
 
         # --- Image FF ---

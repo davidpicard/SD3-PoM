@@ -60,6 +60,7 @@ class PomSD3Transformer2DModel(
         pom_n_groups: int = 1,
         pom_n_sel_heads: int = 24,
         lora_rank: int = 0,
+        pom_rope_max_seq_len: int = 8192,
         # Progressive replacement: last n_pom_blocks blocks are JointPoMBlock,
         # first (num_layers - n_pom_blocks) blocks are JointTransformerBlock (frozen attention).
         n_pom_blocks: int | None = None,
@@ -90,6 +91,7 @@ class PomSD3Transformer2DModel(
             pom_n_groups=pom_n_groups,
             pom_n_sel_heads=pom_n_sel_heads,
             lora_rank=lora_rank,
+            pom_rope_max_seq_len=pom_rope_max_seq_len,
         )
         self.transformer_blocks = nn.ModuleList(
             [

@@ -107,6 +107,7 @@ def build_from_sd3_pretrained(
     pom_n_sel_heads: int = 24,
     lora_rank: int = 16,
     n_pom_blocks: int | None = None,
+    pom_rope_max_seq_len: int = 8192,
     torch_dtype: torch.dtype = torch.bfloat16,
     device: str | torch.device = "cpu",
 ) -> PomSD3Transformer2DModel:
@@ -139,6 +140,7 @@ def build_from_sd3_pretrained(
         pom_n_sel_heads=pom_n_sel_heads,
         lora_rank=lora_rank,
         n_pom_blocks=n_pom,
+        pom_rope_max_seq_len=pom_rope_max_seq_len,
     )
     student = PomSD3Transformer2DModel(**SD35_MEDIUM_CONFIG, **pom_config)
     student = student.to(dtype=torch_dtype)
@@ -184,6 +186,7 @@ def replace_next_attention_block(model: PomSD3Transformer2DModel) -> JointPoMBlo
         pom_n_groups=model.config.pom_n_groups,
         pom_n_sel_heads=model.config.pom_n_sel_heads,
         lora_rank=model.config.lora_rank,
+        pom_rope_max_seq_len=model.config.pom_rope_max_seq_len,
     ).to(dtype=dtype, device=device)
 
     # Transfer FF and norm weights; PoM layers stay randomly initialized
