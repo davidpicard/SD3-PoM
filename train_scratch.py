@@ -15,6 +15,7 @@ Usage (SLURM / torchrun multi-node):
 """
 import argparse
 import contextlib
+import functools
 import json
 import math
 import os
@@ -28,7 +29,16 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    FullStateDictConfig,
+    MixedPrecision,
+    ShardingStrategy,
+    StateDictType,
+)
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.utils.data import DataLoader
+from safetensors.torch import save_file as safetensors_save_file
 
 import wandb
 from diffusers import (
@@ -99,6 +109,29 @@ def cleanup_ddp():
         dist.destroy_process_group()
 
 
+def wrap_model_fsdp(model: torch.nn.Module, local_rank: int) -> torch.nn.Module:
+    """Wrap model in FSDP with FULL_SHARD when running distributed; no-op otherwise."""
+    if not dist.is_initialized():
+        return model
+    from pom_sd3.blocks import JointPoMBlock
+    mp = MixedPrecision(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.bfloat16,
+        buffer_dtype=torch.bfloat16,
+    )
+    wrap_policy = functools.partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={JointPoMBlock},
+    )
+    return FSDP(
+        model,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        auto_wrap_policy=wrap_policy,
+        mixed_precision=mp,
+        device_id=local_rank,
+    )
+
+
 def lr_schedule(step: int, warmup_steps: int, max_steps: int, base_lr: float) -> float:
     if step < warmup_steps:
         return base_lr * step / max(1, warmup_steps)
@@ -115,18 +148,53 @@ def find_latest_checkpoint(out_dir: Path) -> Path | None:
 
 
 def save_checkpoint(model, optimizer, step: int, ckpt_dir: Path) -> None:
-    model.save_pretrained(ckpt_dir)
-    param_to_name = {id(p): n for n, p in model.named_parameters()}
-    named_state = {
-        param_to_name[id(p)]: {
-            k: v.cpu() if isinstance(v, torch.Tensor) else v
-            for k, v in state.items()
+    """Save model weights, optimizer state, and step counter.
+
+    When FSDP is active all ranks must call this (collective state_dict gathering).
+    Only rank 0 writes to disk; a dist.barrier() at the end synchronises ranks.
+    Weights are saved in diffusers format (config.json + model.safetensors) so
+    --init_from / from_pretrained keep working.
+    """
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    if isinstance(model, FSDP):
+        # --- gather full model state dict (rank 0 only, CPU-offloaded) ---
+        fsdp_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, fsdp_cfg):
+            full_sd = model.state_dict()
+        # Strip "_fsdp_wrapped_module." prefix so from_pretrained can load the weights
+        _prefix = "_fsdp_wrapped_module."
+        full_sd = {
+            (k[len(_prefix):] if k.startswith(_prefix) else k): v
+            for k, v in full_sd.items()
         }
-        for p, state in optimizer.state.items()
-        if id(p) in param_to_name
-    }
-    torch.save({"named_state": named_state}, ckpt_dir / "optimizer.pt")
-    (ckpt_dir / "train_state.json").write_text(json.dumps({"step": step}))
+
+        # --- gather full optimizer state dict (collective; rank 0 only) ---
+        full_osd = FSDP.full_optim_state_dict(model, optimizer, offload_to_cpu=True)
+
+        if is_main():
+            safetensors_save_file(full_sd, ckpt_dir / "model.safetensors")
+            # config.json — access inner module for ConfigMixin.save_config
+            inner = getattr(model, "_fsdp_wrapped_module", model)
+            inner.save_config(ckpt_dir)
+            torch.save(full_osd, ckpt_dir / "optimizer.pt")
+            (ckpt_dir / "train_state.json").write_text(json.dumps({"step": step}))
+
+        dist.barrier()
+    else:
+        # Single-GPU path: use diffusers save_pretrained and name-keyed optimizer state
+        model.save_pretrained(ckpt_dir)
+        param_to_name = {id(p): n for n, p in model.named_parameters()}
+        named_state = {
+            param_to_name[id(p)]: {
+                k: v.cpu() if isinstance(v, torch.Tensor) else v
+                for k, v in state.items()
+            }
+            for p, state in optimizer.state.items()
+            if id(p) in param_to_name
+        }
+        torch.save({"named_state": named_state}, ckpt_dir / "optimizer.pt")
+        (ckpt_dir / "train_state.json").write_text(json.dumps({"step": step}))
 
 
 def load_checkpoint_optimizer(opt_data: dict, optimizer, model, device) -> None:
@@ -149,6 +217,13 @@ def load_checkpoint_optimizer(opt_data: dict, optimizer, model, device) -> None:
         new_groups.append(ng)
         pos += len(g["params"])
     optimizer.load_state_dict({"state": new_state, "param_groups": new_groups})
+
+
+def load_optimizer_fsdp(model: FSDP, optimizer, ckpt_dir: Path) -> None:
+    """Scatter a saved full optimizer state dict across FSDP ranks."""
+    full_osd = torch.load(ckpt_dir / "optimizer.pt", map_location="cpu") if is_main() else None
+    sharded_osd = FSDP.scatter_full_optim_state_dict(full_osd, model, optim=optimizer)
+    optimizer.load_state_dict(sharded_osd)
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +449,9 @@ def parse_args():
     p.add_argument("--wandb_project", default="sd3-pom-scratch")
     p.add_argument("--wandb_run_name", default=None)
     p.add_argument("--wandb_offline", action="store_true")
+    p.add_argument("--gradient_checkpointing", action="store_true",
+                   help="Recompute per-block activations to reduce activation memory "
+                        "(~30%% extra compute; recommended at 1024px+)")
     p.add_argument("--smoke_test", action="store_true",
                    help="5 steps on random data with tiny model, then exit")
     return p.parse_args()
@@ -494,14 +572,20 @@ def main():
         ).to(device=device, dtype=torch.bfloat16)
         num_layers = 4
 
-    model.train()
-
-    all_params = list(model.parameters())
     if is_main():
-        n_params = sum(p.numel() for p in all_params)
+        n_params = sum(p.numel() for p in model.parameters())
         print(f"Model parameters: {n_params / 1e6:.1f}M (all trainable)")
 
-    # --- Optimizer ---
+    if args.gradient_checkpointing:
+        model.enable_gradient_checkpointing()
+
+    # FSDP wrapping shards params, grads, and optimizer states across ranks.
+    # Must happen before optimizer creation so the optimizer sees sharded params.
+    model = wrap_model_fsdp(model, local_rank)
+    model.train()
+
+    # --- Optimizer (created on sharded params when FSDP is active) ---
+    all_params = list(model.parameters())
     optimizer = torch.optim.AdamW(
         all_params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.999),
     )
@@ -511,9 +595,12 @@ def main():
     if resume_dir is not None:
         opt_path = resume_dir / "optimizer.pt"
         if opt_path.exists():
-            load_checkpoint_optimizer(
-                torch.load(opt_path, map_location="cpu"), optimizer, model, device
-            )
+            if isinstance(model, FSDP):
+                load_optimizer_fsdp(model, optimizer, resume_dir)
+            else:
+                load_checkpoint_optimizer(
+                    torch.load(opt_path, map_location="cpu"), optimizer, model, device
+                )
             if is_main():
                 print(f"  Optimizer state restored from {opt_path}")
         state_path = resume_dir / "train_state.json"
@@ -619,12 +706,12 @@ def main():
         (loss / args.grad_accum_steps).backward()
 
         if (step + 1) % args.grad_accum_steps == 0:
-            if dist.is_initialized():
-                for p in all_params:
-                    if p.grad is not None:
-                        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
-                        p.grad.div_(world_size)
-            torch.nn.utils.clip_grad_norm_(all_params, 1.0)
+            # FSDP handles gradient synchronisation internally; clip using its
+            # all-ranks norm computation.  Plain model falls back to the standard call.
+            if isinstance(model, FSDP):
+                model.clip_grad_norm_(1.0)
+            else:
+                torch.nn.utils.clip_grad_norm_(all_params, 1.0)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
@@ -642,10 +729,12 @@ def main():
             print(f"step={step:7d}  loss={log['loss']:.4f}  lr={lr:.2e}  {sps:.1f} samp/s")
 
         # --- Checkpointing ---
-        if is_main() and step > 0 and step % args.save_every == 0:
+        # All ranks must participate when FSDP is active (collective state_dict ops).
+        if step > 0 and step % args.save_every == 0:
             ckpt_dir = out_dir / f"step_{step:07d}"
             save_checkpoint(model, optimizer, step, ckpt_dir)
-            print(f"Saved checkpoint to {ckpt_dir}")
+            if is_main():
+                print(f"Saved checkpoint to {ckpt_dir}")
 
         # --- Sample generation ---
         if is_main() and step > 0 and step % args.sample_every == 0 and not args.smoke_test:
@@ -661,9 +750,22 @@ def main():
             return
 
     # --- Final save ---
+    final_dir = out_dir / "final"
+    if isinstance(model, FSDP):
+        fsdp_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, fsdp_cfg):
+            full_sd = model.state_dict()
+        _prefix = "_fsdp_wrapped_module."
+        full_sd = {(k[len(_prefix):] if k.startswith(_prefix) else k): v for k, v in full_sd.items()}
+        if is_main():
+            final_dir.mkdir(parents=True, exist_ok=True)
+            safetensors_save_file(full_sd, final_dir / "model.safetensors")
+            getattr(model, "_fsdp_wrapped_module", model).save_config(final_dir)
+        dist.barrier()
+    else:
+        if is_main():
+            model.save_pretrained(final_dir)
     if is_main():
-        final_dir = out_dir / "final"
-        model.save_pretrained(final_dir)
         print(f"Training complete. Model saved to {final_dir}")
         wandb.finish()
 

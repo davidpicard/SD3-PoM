@@ -48,13 +48,14 @@ srun torchrun \
         --dataset_dir /path/to/gpic \
         --dataset_split train \
         --caption_type all \
-        --image_size 512 \
+        --image_size 1024 \
         --pom_degree 4 \
         --pom_expand 2 \
         --pom_n_groups 1 \
         --pom_n_sel_heads 24 \
         --lora_rank 0 \
-        --batch_size 4 \
+        --gradient_checkpointing \
+        --batch_size 2 \
         --grad_accum_steps 4 \
         --lr 1e-4 \
         --warmup_steps 2000 \
