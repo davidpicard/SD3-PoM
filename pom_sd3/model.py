@@ -132,6 +132,10 @@ class PomSD3Transformer2DModel(
             self.proj_out_lora_A = self.proj_out_lora_B = None
         self.gradient_checkpointing = False
 
+    def _set_gradient_checkpointing(self, module, value: bool = False) -> None:
+        if hasattr(module, "gradient_checkpointing"):
+            module.gradient_checkpointing = value
+
     def merge_lora(self) -> None:
         """Merge LoRA weights into FF down-projections and remove LoRA parameters.
 
