@@ -170,7 +170,7 @@ def save_checkpoint(model, optimizer, step: int, ckpt_dir: Path) -> None:
         }
 
         # --- gather full optimizer state dict (collective; rank 0 only) ---
-        full_osd = FSDP.full_optim_state_dict(model, optimizer, offload_to_cpu=True)
+        full_osd = FSDP.full_optim_state_dict(model, optimizer)
 
         if is_main():
             safetensors_save_file(full_sd, ckpt_dir / "model.safetensors")
