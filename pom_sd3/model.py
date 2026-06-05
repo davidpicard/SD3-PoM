@@ -217,12 +217,13 @@ class PomSD3Transformer2DModel(
             is_skip = skip_layers is not None and index_block in skip_layers
 
             if torch.is_grad_enabled() and self.gradient_checkpointing and not is_skip:
-                encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
+                encoder_hidden_states, hidden_states = torch.utils.checkpoint.checkpoint(
                     block,
                     hidden_states,
                     encoder_hidden_states,
                     temb,
                     joint_attention_kwargs,
+                    use_reentrant=False,
                 )
             elif not is_skip:
                 encoder_hidden_states, hidden_states = block(
