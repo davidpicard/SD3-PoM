@@ -173,7 +173,7 @@ def save_checkpoint(model, optimizer, step: int, ckpt_dir: Path) -> None:
         full_osd = FSDP.full_optim_state_dict(model, optimizer)
 
         if is_main():
-            safetensors_save_file(full_sd, ckpt_dir / "model.safetensors")
+            safetensors_save_file(full_sd, ckpt_dir / "diffusion_pytorch_model.safetensors")
             # config.json — access inner module for ConfigMixin.save_config
             inner = getattr(model, "_fsdp_wrapped_module", model)
             inner.save_config(ckpt_dir)
@@ -782,7 +782,7 @@ def main():
         full_sd = {(k[len(_prefix):] if k.startswith(_prefix) else k): v for k, v in full_sd.items()}
         if is_main():
             final_dir.mkdir(parents=True, exist_ok=True)
-            safetensors_save_file(full_sd, final_dir / "model.safetensors")
+            safetensors_save_file(full_sd, final_dir / "diffusion_pytorch_model.safetensors")
             getattr(model, "_fsdp_wrapped_module", model).save_config(final_dir)
         dist.barrier()
     else:
