@@ -377,7 +377,7 @@ SAMPLE_PROMPTS = [
 ]
 
 
-def generate_samples(model, vae, text_pipe, step: int, device, num_prompts: int = 4):
+def generate_samples(model, vae, text_pipe, step: int, device, num_prompts: int = 4, resolution: int = 1024):
     if text_pipe is None or vae is None:
         return
     if is_main():
@@ -391,7 +391,8 @@ def generate_samples(model, vae, text_pipe, step: int, device, num_prompts: int 
     try:
         for i, prompt in enumerate(SAMPLE_PROMPTS[:num_prompts]):
             with torch.no_grad():
-                img = text_pipe(prompt, num_inference_steps=28, guidance_scale=4.0).images[0]
+                img = text_pipe(prompt, num_inference_steps=28, guidance_scale=4.0,
+                               height=resolution, width=resolution).images[0]
             if is_main():
                 path = os.path.join(tmpdir, f"{i:03d}.jpg")
                 img.save(path, format="JPEG", quality=85)
@@ -762,7 +763,8 @@ def main():
         # --- Sample generation ---
         if step > 0 and step % args.sample_every == 0 and not args.smoke_test:
             model.eval()
-            generate_samples(model, vae, text_pipe, step, device, args.num_sample_prompts)
+            generate_samples(model, vae, text_pipe, step, device, args.num_sample_prompts,
+                             resolution=args.image_size)
             model.train()
 
         step += 1
