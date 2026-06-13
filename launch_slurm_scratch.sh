@@ -8,7 +8,7 @@
 #SBATCH --time=48:00:00
 #SBATCH --output=logs/%j.out
 #SBATCH --error=logs/%j.err
-#SBATCH --signal=B:USR1@300   # send SIGUSR1 to this script 5 min before wall time
+#SBATCH --signal=USR1@300     # send SIGUSR1 to batch script and job steps 5 min before wall time
 
 mkdir -p logs
 

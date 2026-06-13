@@ -21,6 +21,7 @@ import math
 import os
 import random
 import shutil
+import signal
 import sys
 import tempfile
 import time
@@ -93,6 +94,15 @@ def _silence_encoding_noise():
 
 def is_main() -> bool:
     return not dist.is_initialized() or dist.get_rank() == 0
+
+
+_save_and_exit = False
+
+def _handle_sigusr1(signum, frame):
+    global _save_and_exit
+    _save_and_exit = True
+
+signal.signal(signal.SIGUSR1, _handle_sigusr1)
 
 
 def setup_ddp():
@@ -768,6 +778,14 @@ def main():
             model.train()
 
         step += 1
+
+        if _save_and_exit:
+            ckpt_dir = out_dir / f"step_{step:07d}"
+            save_checkpoint(model, optimizer, step, ckpt_dir)
+            if is_main():
+                print(f"Signal received — saved checkpoint to {ckpt_dir}. Exiting.")
+            cleanup_ddp()
+            sys.exit(0)
 
         if args.smoke_test and step >= 5:
             print("Smoke test passed — 5 steps completed successfully.")
