@@ -21,7 +21,6 @@ import math
 import os
 import random
 import shutil
-import signal
 import sys
 import tempfile
 import time
@@ -94,15 +93,6 @@ def _silence_encoding_noise():
 
 def is_main() -> bool:
     return not dist.is_initialized() or dist.get_rank() == 0
-
-
-_save_and_exit = False
-
-def _handle_sigusr1(signum, frame):
-    global _save_and_exit
-    _save_and_exit = True
-
-signal.signal(signal.SIGUSR1, _handle_sigusr1)
 
 
 def setup_ddp():
@@ -779,11 +769,12 @@ def main():
 
         step += 1
 
-        if _save_and_exit:
+        if (out_dir / ".save_and_exit").exists():
             ckpt_dir = out_dir / f"step_{step:07d}"
             save_checkpoint(model, optimizer, step, ckpt_dir)
             if is_main():
-                print(f"Signal received — saved checkpoint to {ckpt_dir}. Exiting.")
+                (out_dir / ".save_and_exit").unlink(missing_ok=True)
+                print(f"Wall-time signal — saved checkpoint to {ckpt_dir}. Exiting.")
             cleanup_ddp()
             sys.exit(0)
 

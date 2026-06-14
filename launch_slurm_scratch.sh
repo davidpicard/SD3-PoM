@@ -8,7 +8,7 @@
 #SBATCH --time=48:00:00
 #SBATCH --output=logs/%j.out
 #SBATCH --error=logs/%j.err
-#SBATCH --signal=USR1@300     # send SIGUSR1 to batch script and job steps 5 min before wall time
+#SBATCH --signal=B:USR1@300   # send SIGUSR1 to this script 5 min before wall time
 
 mkdir -p logs
 
@@ -25,6 +25,7 @@ _requeue() {
         echo "$(date): Training complete — skipping requeue."
     else
         echo "$(date): Wall time approaching — requeueing job $SLURM_JOB_ID ..."
+        touch "$OUTPUT_DIR/.save_and_exit"
         scontrol requeue "$SLURM_JOB_ID"
     fi
 }
@@ -67,5 +68,6 @@ srun torchrun \
         --wandb_offline &
 
 wait $!
+rm -f "$OUTPUT_DIR/.save_and_exit"
 # After training, sync wandb runs:
 #   wandb sync ./wandb/run-*
