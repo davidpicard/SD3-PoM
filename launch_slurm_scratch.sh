@@ -20,14 +20,17 @@ mkdir -p logs
 OUTPUT_DIR=/path/to/scratch-phase1
 INIT_FROM=""   # set to previous phase final dir when starting a new resolution stage
 
+rm -f "$OUTPUT_DIR/.save_and_exit"   # clear any stale sentinel from a previous run
+
 _requeue() {
     if [ -d "$OUTPUT_DIR/final" ]; then
         echo "$(date): Training complete — skipping requeue."
-    else
-        echo "$(date): Wall time approaching — requeueing job $SLURM_JOB_ID ..."
-        touch "$OUTPUT_DIR/.save_and_exit"
-        scontrol requeue "$SLURM_JOB_ID"
+        return
     fi
+    echo "$(date): Wall time approaching — flagging for checkpoint save ..."
+    touch "$OUTPUT_DIR/.save_and_exit"
+    # scontrol requeue is NOT called here: it kills the job immediately,
+    # before Python can write the checkpoint. Requeue happens after wait below.
 }
 trap _requeue USR1
 
@@ -66,8 +69,19 @@ srun torchrun \
         --sample_every 5000 \
         --wandb_project sd3-pom-scratch \
         --wandb_offline &
+SRUN_PID=$!
 
-wait $!
+# USR1 interrupts 'wait', causing it to return with exit status ≥128 even though
+# srun is still running. Loop until srun actually exits (Python saved and quit).
+wait $SRUN_PID
+while [ $? -ge 128 ]; do
+    wait $SRUN_PID
+done
+
 rm -f "$OUTPUT_DIR/.save_and_exit"
+if [ ! -d "$OUTPUT_DIR/final" ]; then
+    echo "$(date): Requeueing job $SLURM_JOB_ID ..."
+    scontrol requeue "$SLURM_JOB_ID"
+fi
 # After training, sync wandb runs:
 #   wandb sync ./wandb/run-*
