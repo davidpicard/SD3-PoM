@@ -456,6 +456,12 @@ def parse_args():
                         "Use 32768 for 2048px.")
     p.add_argument("--lora_rank", type=int, default=0,
                    help="LoRA rank for FF layers (0 = no LoRA, recommended for from-scratch)")
+    p.add_argument("--hybrid_n", type=int, default=1,
+                   help="Block period: 1=full PoM, 0=full local attention, "
+                        "k≥2=PoM every k layers with (k-1) LocalAttn in between")
+    p.add_argument("--attention_window_m", type=int, default=4,
+                   help="Half-side of 2D local attention window; each image token attends "
+                        "to a (2m+1)×(2m+1) neighbourhood. Ignored when hybrid_n=1.")
 
     # Training
     p.add_argument("--batch_size", type=int, default=4)
@@ -583,6 +589,8 @@ def main():
             pom_n_sel_heads=args.pom_n_sel_heads,
             lora_rank=args.lora_rank,
             pom_rope_max_seq_len=args.pom_rope_max_seq_len,
+            hybrid_n=args.hybrid_n,
+            attention_window_m=args.attention_window_m,
         ).to(device=device, dtype=torch.bfloat16)
     else:
         model = PomSD3Transformer2DModel(
@@ -593,6 +601,8 @@ def main():
             pos_embed_max_size=32, dual_attention_layers=(0,),
             pom_degree=2, pom_expand=2, pom_n_groups=1, pom_n_sel_heads=1,
             lora_rank=0, n_pom_blocks=4,
+            hybrid_n=args.hybrid_n,
+            attention_window_m=args.attention_window_m,
         ).to(device=device, dtype=torch.bfloat16)
         num_layers = 4
 

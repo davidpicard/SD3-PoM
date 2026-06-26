@@ -58,6 +58,8 @@ srun torchrun \
         --pom_n_groups 1 \
         --pom_n_sel_heads 24 \
         --lora_rank 0 \
+        --hybrid_n 2 \
+        --attention_window_m 4 \
         --gradient_checkpointing \
         --batch_size 2 \
         --grad_accum_steps 4 \

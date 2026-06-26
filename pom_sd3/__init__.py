@@ -1,4 +1,4 @@
-from .blocks import JointPoMBlock
+from .blocks import JointLocalAttnBlock, JointPoMBlock
 from .convert import (
     SD35_MEDIUM_CONFIG,
     build_from_sd3_pretrained,
@@ -8,6 +8,7 @@ from .convert import (
 from .model import PomSD3Transformer2DModel
 
 __all__ = [
+    "JointLocalAttnBlock",
     "JointPoMBlock",
     "PomSD3Transformer2DModel",
     "SD35_MEDIUM_CONFIG",

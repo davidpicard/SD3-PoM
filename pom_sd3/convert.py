@@ -5,7 +5,7 @@ import torch
 from diffusers import SD3Transformer2DModel
 from diffusers.models.attention import JointTransformerBlock
 
-from .blocks import JointPoMBlock
+from .blocks import JointLocalAttnBlock, JointPoMBlock
 from .model import PomSD3Transformer2DModel
 
 # SD3.5 Medium config
@@ -33,14 +33,30 @@ def _is_attention_key(key: str) -> bool:
     return bool(_ATTENTION_KEY_RE.search(key))
 
 
-def _is_pom_block_attention_key(key: str, n_pom_blocks: int, num_layers: int) -> bool:
-    """True only for attention keys that belong to a PoM block (should be skipped on load)."""
+def _is_pom_block_attention_key(
+    key: str,
+    n_pom_blocks: int,
+    num_layers: int,
+    hybrid_n: int = 1,
+) -> bool:
+    """True only for attention keys that belong to a PoM block (should be skipped on load).
+
+    PoM blocks have no QKV attention weights; LocalAttn and JointTransformerBlock
+    blocks keep them and must load them from the pretrained checkpoint.
+    """
     m = _BLOCK_IDX_RE.match(key)
     if m is None:
         return False
+    if not _ATTENTION_KEY_RE.search(key):
+        return False
     block_idx = int(m.group(1))
-    is_pom_block = block_idx >= num_layers - n_pom_blocks
-    return is_pom_block and bool(_ATTENTION_KEY_RE.search(key))
+    if hybrid_n == 0:
+        return False  # all blocks are LocalAttn — keep all attention keys
+    elif hybrid_n == 1:
+        # Legacy: last n_pom_blocks blocks are PoM
+        return block_idx >= num_layers - n_pom_blocks
+    else:
+        return block_idx % hybrid_n == 0
 
 
 def load_sd3_weights_into_pom(
@@ -51,13 +67,14 @@ def load_sd3_weights_into_pom(
     """Copy weights from teacher_state_dict into student.
 
     For PoM blocks: attention keys are skipped (PoM has no attention).
-    For JointTransformerBlock blocks (n_pom_blocks < num_layers): all keys including
+    For JointLocalAttnBlock / JointTransformerBlock blocks: all keys including
     attention are loaded so those blocks are exact copies of the teacher.
 
     Returns (missing_keys, unexpected_keys).
     """
     n_pom = getattr(student.config, "n_pom_blocks", None)
     num_layers = student.config.num_layers
+    hybrid_n = getattr(student.config, "hybrid_n", 1)
     if n_pom is None:
         n_pom = num_layers  # all blocks are PoM (legacy behaviour)
 
@@ -66,7 +83,7 @@ def load_sd3_weights_into_pom(
     shape_mismatches = []
 
     for key, val in teacher_state_dict.items():
-        if _is_pom_block_attention_key(key, n_pom, num_layers):
+        if _is_pom_block_attention_key(key, n_pom, num_layers, hybrid_n):
             continue  # PoM blocks have no attention weights
         if key not in student_dict:
             continue
@@ -83,12 +100,12 @@ def load_sd3_weights_into_pom(
 
     missing, unexpected = student.load_state_dict(transfer, strict=False)
 
-    # Filter: missing keys that are NOT PoM-specific, LoRA, or attention blocks are a problem
+    # Filter: missing keys that are NOT PoM-specific, LoRA, or PoM-block attention are a problem
     pom_key_fragments = (".pom.", ".pom2.", ".ff_lora_", ".ff_context_lora_", "proj_out_lora_")
     non_pom_missing = [
         k for k in missing
         if not any(f in k for f in pom_key_fragments)
-        and not _is_pom_block_attention_key(k, n_pom, num_layers)
+        and not _is_pom_block_attention_key(k, n_pom, num_layers, hybrid_n)
     ]
     if strict_non_attention and non_pom_missing:
         raise RuntimeError(
@@ -108,14 +125,17 @@ def build_from_sd3_pretrained(
     lora_rank: int = 16,
     n_pom_blocks: int | None = None,
     pom_rope_max_seq_len: int = 8192,
+    hybrid_n: int = 1,
+    attention_window_m: int = 4,
     torch_dtype: torch.dtype = torch.bfloat16,
     device: str | torch.device = "cpu",
 ) -> PomSD3Transformer2DModel:
     """Load SD3.5 transformer weights into a fresh PomSD3Transformer2DModel.
 
-    When n_pom_blocks < num_layers, the first (num_layers - n_pom_blocks) blocks are
-    JointTransformerBlock with all weights (including attention) loaded from the pretrained
-    checkpoint. The last n_pom_blocks blocks are JointPoMBlock with attention weights skipped.
+    hybrid_n controls the block-type pattern (see PomSD3Transformer2DModel docstring).
+    When hybrid_n==1 and n_pom_blocks < num_layers, the first (num_layers - n_pom_blocks)
+    blocks are JointTransformerBlock with all weights loaded; the last n_pom_blocks
+    are JointPoMBlock with attention weights skipped.
     """
     from pathlib import Path
     local_files_only = Path(model_id).exists()
@@ -141,11 +161,20 @@ def build_from_sd3_pretrained(
         lora_rank=lora_rank,
         n_pom_blocks=n_pom,
         pom_rope_max_seq_len=pom_rope_max_seq_len,
+        hybrid_n=hybrid_n,
+        attention_window_m=attention_window_m,
     )
     student = PomSD3Transformer2DModel(**SD35_MEDIUM_CONFIG, **pom_config)
     student = student.to(dtype=torch_dtype)
 
-    print(f"Transferring weights ({n_pom}/{num_layers} PoM blocks, {num_layers - n_pom} attention blocks) ...")
+    if hybrid_n == 0:
+        block_summary = f"0 PoM, {num_layers} LocalAttn"
+    elif hybrid_n == 1:
+        block_summary = f"{n_pom} PoM, {num_layers - n_pom} JointTransformer"
+    else:
+        n_pom_h = sum(1 for i in range(num_layers) if i % hybrid_n == 0)
+        block_summary = f"{n_pom_h} PoM, {num_layers - n_pom_h} LocalAttn (period={hybrid_n})"
+    print(f"Transferring weights ({block_summary}) ...")
     missing, _ = load_sd3_weights_into_pom(student, teacher_sd)
     pom_keys = [k for k in missing if any(f in k for f in (".pom.", ".pom2."))]
     print(f"  PoM-specific params randomly initialized: {len(pom_keys)} keys")
@@ -156,11 +185,18 @@ def build_from_sd3_pretrained(
 def replace_next_attention_block(model: PomSD3Transformer2DModel) -> JointPoMBlock:
     """Replace the next attention block (from the end) with a JointPoMBlock.
 
+    Only valid when hybrid_n==1 (legacy progressive-replacement mode).
     Updates model.transformer_blocks in-place, transfers FF/norm weights from the
     outgoing JointTransformerBlock, and bumps n_pom_blocks in the config.
 
     Returns the new block so the caller can register its params with the optimizer.
     """
+    hybrid_n = getattr(model.config, "hybrid_n", 1)
+    if hybrid_n != 1:
+        raise ValueError(
+            "replace_next_attention_block is only supported when hybrid_n==1 "
+            "(progressive replacement mode)"
+        )
     n_pom = model.config.n_pom_blocks if model.config.n_pom_blocks is not None else model.config.num_layers
     num_layers = model.config.num_layers
     if n_pom >= num_layers:

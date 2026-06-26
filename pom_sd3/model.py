@@ -14,7 +14,7 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import AdaLayerNormContinuous
 from diffusers.utils import logging
 
-from .blocks import JointPoMBlock
+from .blocks import JointLocalAttnBlock, JointPoMBlock
 
 logger = logging.get_logger(__name__)
 
@@ -22,20 +22,22 @@ logger = logging.get_logger(__name__)
 class PomSD3Transformer2DModel(
     ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixin, SD3Transformer2DLoadersMixin
 ):
-    """SD3.5 transformer with all attention layers replaced by PoM.
+    """SD3.5 transformer with PoM and/or windowed local attention replacing full attention.
+
+    Block assignment is controlled by hybrid_n:
+      hybrid_n=1 (default): all blocks are JointPoMBlock (full-PoM model).
+          n_pom_blocks can still be used for progressive replacement.
+      hybrid_n=0: all blocks are JointLocalAttnBlock (full local-attention model).
+      hybrid_n=k (k≥2): block i is PoM if i%k==0, else JointLocalAttnBlock.
 
     Non-attention weights (patch embed, time/text embeddings, norms, FF layers,
-    output projection) are identical to SD3Transformer2DModel and can be loaded
-    directly from a pretrained SD3.5 checkpoint via `from_sd3_pretrained`.
-
-    The forward signature is identical to SD3Transformer2DModel so this model
-    can be plugged into StableDiffusion3Pipeline as a drop-in replacement.
-    Pass `return_intermediate=True` during distillation training to also get
-    a list of per-block (encoder_hidden_states, hidden_states) outputs.
+    output projection) are identical to SD3Transformer2DModel and load directly
+    from a pretrained SD3.5 checkpoint.  JointLocalAttnBlock also keeps the full
+    set of attention projection weights (to_q/k/v etc.) from the checkpoint.
     """
 
     _supports_gradient_checkpointing = True
-    _no_split_modules = ["JointPoMBlock"]
+    _no_split_modules = ["JointPoMBlock", "JointLocalAttnBlock"]
     _skip_layerwise_casting_patterns = ["pos_embed", "norm"]
 
     @register_to_config
@@ -61,9 +63,13 @@ class PomSD3Transformer2DModel(
         pom_n_sel_heads: int = 24,
         lora_rank: int = 0,
         pom_rope_max_seq_len: int = 8192,
-        # Progressive replacement: last n_pom_blocks blocks are JointPoMBlock,
-        # first (num_layers - n_pom_blocks) blocks are JointTransformerBlock (frozen attention).
+        # Progressive replacement (legacy, used only when hybrid_n==1):
+        # last n_pom_blocks blocks are JointPoMBlock,
+        # first (num_layers - n_pom_blocks) blocks are JointTransformerBlock.
         n_pom_blocks: int | None = None,
+        # Hybrid mode
+        hybrid_n: int = 1,
+        attention_window_m: int = 4,
     ):
         super().__init__()
         self.out_channels = out_channels if out_channels is not None else in_channels
@@ -82,9 +88,6 @@ class PomSD3Transformer2DModel(
         )
         self.context_embedder = nn.Linear(joint_attention_dim, caption_projection_dim)
 
-        n_pom = num_layers if n_pom_blocks is None else n_pom_blocks
-        n_attn = num_layers - n_pom  # first n_attn blocks stay as JointTransformerBlock
-
         pom_kwargs = dict(
             pom_degree=pom_degree,
             pom_expand=pom_expand,
@@ -93,28 +96,32 @@ class PomSD3Transformer2DModel(
             lora_rank=lora_rank,
             pom_rope_max_seq_len=pom_rope_max_seq_len,
         )
-        self.transformer_blocks = nn.ModuleList(
-            [
-                JointTransformerBlock(
-                    dim=self.inner_dim,
-                    num_attention_heads=num_attention_heads,
-                    attention_head_dim=attention_head_dim,
-                    context_pre_only=(i == num_layers - 1),
-                    qk_norm=qk_norm,
-                    use_dual_attention=(i in dual_attention_layers),
-                ) if i < n_attn else
-                JointPoMBlock(
-                    dim=self.inner_dim,
-                    num_attention_heads=num_attention_heads,
-                    attention_head_dim=attention_head_dim,
-                    context_pre_only=(i == num_layers - 1),
-                    qk_norm=qk_norm,
-                    use_dual_attention=(i in dual_attention_layers),
-                    **pom_kwargs,
-                )
-                for i in range(num_layers)
-            ]
-        )
+        local_kwargs = dict(attention_window_m=attention_window_m)
+
+        def _make_block(i: int) -> nn.Module:
+            common = dict(
+                dim=self.inner_dim,
+                num_attention_heads=num_attention_heads,
+                attention_head_dim=attention_head_dim,
+                context_pre_only=(i == num_layers - 1),
+                qk_norm=qk_norm,
+                use_dual_attention=(i in dual_attention_layers),
+            )
+            if hybrid_n == 1:
+                # Legacy behaviour: n_pom_blocks controls which blocks are PoM vs full-attn
+                n_pom = num_layers if n_pom_blocks is None else n_pom_blocks
+                n_attn = num_layers - n_pom
+                if i < n_attn:
+                    return JointTransformerBlock(**common)
+                return JointPoMBlock(**common, **pom_kwargs)
+            elif hybrid_n == 0:
+                return JointLocalAttnBlock(**common, **local_kwargs)
+            else:
+                if i % hybrid_n == 0:
+                    return JointPoMBlock(**common, **pom_kwargs)
+                return JointLocalAttnBlock(**common, **local_kwargs)
+
+        self.transformer_blocks = nn.ModuleList([_make_block(i) for i in range(num_layers)])
 
         self.norm_out = AdaLayerNormContinuous(
             self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6
@@ -137,11 +144,7 @@ class PomSD3Transformer2DModel(
             module.gradient_checkpointing = value
 
     def merge_lora(self) -> None:
-        """Merge LoRA weights into FF down-projections and remove LoRA parameters.
-
-        After this call lora_rank is effectively 0: no extra memory, no extra
-        computation. save_pretrained() produces a checkpoint without LoRA keys.
-        """
+        """Merge LoRA weights into FF down-projections and remove LoRA parameters."""
         for blk in self.transformer_blocks:
             if getattr(blk, 'ff_lora_A', None) is not None:
                 blk.ff.net[2].weight.data += blk.ff_lora_B.weight.data @ blk.ff_lora_A.weight.data
