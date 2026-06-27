@@ -609,6 +609,9 @@ def main():
     if is_main():
         n_params = sum(p.numel() for p in model.parameters())
         print(f"Model parameters: {n_params / 1e6:.1f}M (all trainable)")
+        model_cfg = dict(model.config)
+        print("Model config:", json.dumps(model_cfg, indent=2, default=str))
+        wandb.config.update({"model_" + k: v for k, v in model_cfg.items()}, allow_val_change=True)
 
     if args.gradient_checkpointing:
         model.enable_gradient_checkpointing()
