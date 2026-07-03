@@ -91,6 +91,147 @@ def _silence_encoding_noise():
         tok_logger.setLevel(old_level)
 
 
+def print_model_summary(model: torch.nn.Module, label: str = "") -> None:
+    """Print a per-layer-type parameter count table to stdout."""
+    groups = {
+        "PoM operators":   lambda n: ".pom." in n or ".pom2." in n,
+        "FF LoRA":         lambda n: ".ff_lora_" in n or ".ff_context_lora_" in n,
+        "proj_out LoRA":   lambda n: "proj_out_lora_" in n,
+        "norm_out":        lambda n: "norm_out." in n,
+        "Attention":       lambda n: ".attn." in n,
+        "Feed-forward":    lambda n: ((".ff." in n or ".ff_context." in n)
+                                      and ".ff_lora_" not in n
+                                      and ".ff_context_lora_" not in n),
+        "Block norms":     lambda n: ".norm1" in n or ".norm2" in n,
+        "Embeddings":      lambda n: any(k in n for k in (
+                               "pos_embed", "time_text_embed",
+                               "context_embedder", "patch_embed")),
+        "proj_out (base)": lambda n: "proj_out" in n and "proj_out_lora_" not in n,
+    }
+    totals: dict[str, int] = {g: 0 for g in groups}
+    trainable: dict[str, int] = {g: 0 for g in groups}
+    totals["Other"] = trainable["Other"] = 0
+    for name, param in model.named_parameters():
+        n = param.numel()
+        t = n if param.requires_grad else 0
+        matched = False
+        for g, pred in groups.items():
+            if pred(name):
+                totals[g] += n
+                trainable[g] += t
+                matched = True
+                break
+        if not matched:
+            totals["Other"] += n
+            trainable["Other"] += t
+    all_groups = list(groups) + ["Other"]
+    header = f"Model summary{' — ' + label if label else ''}"
+    print(f"\n{header}")
+    print(f"  {'Layer type':<22}  {'Total':>10}  {'Trainable':>10}")
+    print(f"  {'-'*22}  {'-'*10}  {'-'*10}")
+    for first_trainable in (True, False):
+        for g in all_groups:
+            if (trainable[g] > 0) != first_trainable or totals[g] == 0:
+                continue
+            print(f"  {g:<22}  {totals[g]/1e6:>9.2f}M  {trainable[g]/1e6:>9.2f}M")
+    grand_total = sum(totals.values())
+    grand_trainable = sum(trainable.values())
+    print(f"  {'─'*22}  {'─'*10}  {'─'*10}")
+    print(f"  {'TOTAL':<22}  {grand_total/1e6:>9.2f}M  {grand_trainable/1e6:>9.2f}M\n")
+
+
+def print_model_layers(model: torch.nn.Module) -> None:
+    """Print a per-layer description: block type, trainable params, and role."""
+    from diffusers.models.attention import JointTransformerBlock
+    try:
+        from pom_sd3.blocks import JointPoMBlock, JointLocalAttnBlock
+    except ImportError:
+        JointPoMBlock = JointLocalAttnBlock = None
+
+    def _tr(mod):
+        return sum(p.numel() for p in mod.parameters() if p.requires_grad)
+
+    cfg = model.config
+    W = 38  # width of the name/type column
+
+    print("Model layers")
+    print(f"  {'Layer':<{W}}  {'Trainable':>10}  Description")
+    print(f"  {'─'*W}  {'─'*10}  {'─'*50}")
+
+    # --- Input layers ---
+    for attr, desc in [
+        ("pos_embed",        f"latent patches → image tokens (patch_size={cfg.patch_size})"),
+        ("time_text_embed",  f"timestep + pooled({cfg.pooled_projection_dim}) → temb({model.inner_dim})"),
+        ("context_embedder", f"text enc({cfg.joint_attention_dim}) → ctx({cfg.caption_projection_dim})"),
+    ]:
+        mod = getattr(model, attr, None)
+        if mod is None:
+            continue
+        name_col = f"{attr}  [{type(mod).__name__}]"
+        t = _tr(mod)
+        print(f"  {name_col:<{W}}  {t/1e6:>9.2f}M  {desc}")
+
+    print(f"  {'─'*W}  {'─'*10}  {'─'*50}")
+
+    # --- Transformer blocks ---
+    for i, blk in enumerate(model.transformer_blocks):
+        bname = type(blk).__name__
+        t = _tr(blk)
+        tr_str = f"{t/1e6:9.2f}M" if t > 0 else "  (frozen)"
+
+        dual = getattr(blk, "use_dual_attention", False)
+        cpo  = getattr(blk, "context_pre_only", False)
+
+        if JointPoMBlock is not None and isinstance(blk, JointPoMBlock):
+            mix = f"joint PoM deg={cfg.pom_degree} exp={cfg.pom_expand}"
+            if dual:
+                mix += " + dual PoM"
+        elif JointLocalAttnBlock is not None and isinstance(blk, JointLocalAttnBlock):
+            mix = f"local attn window={getattr(blk, 'window_m', '?')}"
+            if dual:
+                mix += " + dual local attn"
+        elif isinstance(blk, JointTransformerBlock):
+            mix = "joint full attn"
+            if dual:
+                mix += " + dual attn"
+        else:
+            mix = bname
+
+        ff = "img FF + txt FF" if not cpo else "img FF only"
+        flags = []
+        if dual:
+            flags.append("dual")
+        if cpo:
+            flags.append("ctx-pre-only")
+        flag_str = f"  [{', '.join(flags)}]" if flags else ""
+
+        name_col = f"[{i:2d}] {bname}"
+        print(f"  {name_col:<{W}}  {tr_str:>10}  {mix}, {ff}{flag_str}")
+
+    print(f"  {'─'*W}  {'─'*10}  {'─'*50}")
+
+    # --- Output layers ---
+    for attr, desc in [
+        ("norm_out", "AdaLN output norm conditioned on temb"),
+        ("proj_out", f"Linear({model.inner_dim} → {cfg.patch_size**2 * cfg.out_channels})  unpatchify"),
+    ]:
+        mod = getattr(model, attr, None)
+        if mod is None:
+            continue
+        name_col = f"{attr}  [{type(mod).__name__}]"
+        t = _tr(mod)
+        print(f"  {name_col:<{W}}  {t/1e6:>9.2f}M  {desc}")
+
+    lora_A = getattr(model, "proj_out_lora_A", None)
+    if lora_A is not None:
+        rank = lora_A.out_features
+        t = _tr(lora_A) + _tr(model.proj_out_lora_B)
+        name_col = f"proj_out_lora  [LoRA rank={rank}]"
+        print(f"  {name_col:<{W}}  {t/1e6:>9.2f}M  LoRA on proj_out (merged at end of training)")
+
+    print()
+
+
 def is_main() -> bool:
     return not dist.is_initialized() or dist.get_rank() == 0
 
@@ -607,8 +748,8 @@ def main():
         num_layers = 4
 
     if is_main():
-        n_params = sum(p.numel() for p in model.parameters())
-        print(f"Model parameters: {n_params / 1e6:.1f}M (all trainable)")
+        print_model_summary(model, label="all blocks PoM, all trainable")
+        print_model_layers(model)
         model_cfg = dict(model.config)
         print("Model config:", json.dumps(model_cfg, indent=2, default=str))
         wandb.config.update({"model_" + k: v for k, v in model_cfg.items()}, allow_val_change=True)
