@@ -649,6 +649,7 @@ def main():
             name=args.wandb_run_name,
             config=vars(args),
             mode="offline" if args.wandb_offline else "online",
+            settings=wandb.Settings(console="off"),
         )
 
     # --- Resolve checkpoint paths ---
@@ -750,6 +751,13 @@ def main():
     if is_main():
         print_model_summary(model, label="all blocks PoM, all trainable")
         print_model_layers(model)
+        import io as _io
+        _buf = _io.StringIO()
+        _saved = sys.stdout; sys.stdout = _buf
+        print_model_summary(model, label="all blocks PoM, all trainable")
+        print_model_layers(model)
+        sys.stdout = _saved
+        wandb.log({"model_structure": wandb.Html(f"<pre>{_buf.getvalue()}</pre>")}, step=0)
         model_cfg = dict(model.config)
         print("Model config:", json.dumps(model_cfg, indent=2, default=str))
         wandb.config.update({"model_" + k: v for k, v in model_cfg.items()}, allow_val_change=True)

@@ -654,6 +654,7 @@ def main():
             name=args.wandb_run_name,
             config=vars(args),
             mode="offline" if args.wandb_offline else "online",
+            settings=wandb.Settings(console="off"),
         )
 
     # --- Validate data source ---
@@ -822,6 +823,13 @@ def main():
         n_pom_now = raw_student.config.n_pom_blocks or num_layers
         print_model_summary(raw_student, label=f"{n_pom_now}/{num_layers} PoM blocks")
         print_model_layers(raw_student)
+        import io as _io
+        _buf = _io.StringIO()
+        _saved = sys.stdout; sys.stdout = _buf
+        print_model_summary(raw_student, label=f"{n_pom_now}/{num_layers} PoM blocks")
+        print_model_layers(raw_student)
+        sys.stdout = _saved
+        wandb.log({"model_structure": wandb.Html(f"<pre>{_buf.getvalue()}</pre>")}, step=0)
 
     optimizer = torch.optim.AdamW(
         pom_params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.999),
