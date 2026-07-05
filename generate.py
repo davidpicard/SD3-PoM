@@ -83,9 +83,14 @@ def main():
 
     print(f"Loading text encoders from {args.model_id} ...")
     pipe = StableDiffusion3Pipeline.from_pretrained(
-        args.model_id, transformer=model, vae=vae,
+        args.model_id, transformer=None, vae=None,
         torch_dtype=dtype, local_files_only=local_files_only,
     )
+    for enc in (pipe.text_encoder, pipe.text_encoder_2, pipe.text_encoder_3):
+        if enc is not None:
+            enc.to(device)
+    pipe.transformer = model
+    pipe.vae = vae
     pipe.set_progress_bar_config(disable=False)
 
     print("\nReady. Enter prompts interactively. Press Ctrl-D to quit.\n")
