@@ -532,7 +532,7 @@ def generate_samples(model, vae, text_pipe, step: int, device, num_prompts: int 
     try:
         for i, prompt in enumerate(SAMPLE_PROMPTS[:num_prompts]):
             with torch.no_grad():
-                img = text_pipe(prompt, num_inference_steps=28, guidance_scale=4.0,
+                img = text_pipe(prompt, num_inference_steps=28, guidance_scale=8.0,
                                height=resolution, width=resolution).images[0]
             if is_main():
                 path = os.path.join(tmpdir, f"{i:03d}.jpg")
