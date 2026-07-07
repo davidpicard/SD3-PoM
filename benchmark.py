@@ -228,7 +228,7 @@ def main():
                    help="Generation resolution in pixels (default 512)")
     p.add_argument("--steps", type=int, default=28,
                    help="Number of denoising steps (default 28)")
-    p.add_argument("--batch_sizes", default="1,2,4,8,16",
+    p.add_argument("--batch_sizes", default="1,2,4,8,16, 32",
                    help="Comma-separated batch sizes to benchmark")
     p.add_argument("--warmup", type=int, default=2,
                    help="Warmup forward passes before timing (default 2)")
