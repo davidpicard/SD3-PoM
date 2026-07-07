@@ -24,9 +24,15 @@ from .masks import build_joint_mask
 
 try:
     from torch.nn.attention.flex_attention import (
-        flex_attention as _flex_attn,
+        flex_attention as _flex_attn_raw,
         create_block_mask,
     )
+    try:
+        from torch.nn.attention.flex_attention import AuxRequest as _AuxRequest
+        _FLEX_USE_AUX = True
+    except ImportError:
+        _FLEX_USE_AUX = False  # older PyTorch: use return_lse instead
+    _flex_attn = torch.compile(_flex_attn_raw)
     _FLEX_AVAILABLE = True
 except ImportError:
     _FLEX_AVAILABLE = False
@@ -77,6 +83,15 @@ def _qkv(attn, norm_img, norm_txt, B, n_img, n_txt, H, d, context_pre_only: bool
     return q_img, k_img, v_img, q_txt, k_txt, v_txt
 
 
+def _flex_attn_lse(q, k, v, block_mask):
+    """Call compiled flex_attention and return (out, lse), handling API versions."""
+    if _FLEX_USE_AUX:
+        out, aux = _flex_attn(q, k, v, block_mask=block_mask, return_aux=_AuxRequest(lse=True))
+        return out, aux.lse
+    else:
+        return _flex_attn(q, k, v, block_mask=block_mask, return_lse=True)
+
+
 def _merge_lse(out1, lse1, out2, lse2, dtype):
     """Combine two partial attention outputs via the online-softmax LSE formula.
 
@@ -104,9 +119,9 @@ def _joint_local_flex(attn, norm_img, norm_txt, n_img, n_txt, window_m, device, 
         attn, norm_img, norm_txt, B, n_img, n_txt, H, d, cpo
     )
 
-    # --- Image → windowed image (flex_attn, O(N·w)) ---
+    # --- Image → windowed image (compiled flex_attn, O(N·w)) ---
     bm = _get_block_mask(n_img, window_m, device)
-    out_local, lse_local = _flex_attn(q_img, k_img, v_img, block_mask=bm, return_lse=True)
+    out_local, lse_local = _flex_attn_lse(q_img, k_img, v_img, bm)
     # out_local: [B, H, N_img, D];  lse_local: [B, H, N_img] float32
 
     # --- Image → all text (SDPA, N_txt=154 is small, no mask needed) ---
@@ -150,7 +165,7 @@ def _img_local_flex(attn, norm_img, n_img, window_m, device, dtype):
         k = attn.norm_k(k)
 
     bm = _get_block_mask(n_img, window_m, device)
-    out = _flex_attn(q, k, v, block_mask=bm)
+    out = _flex_attn(q, k, v, block_mask=bm)  # compiled, no LSE needed
     out = out.transpose(1, 2).reshape(B, n_img, H * d)
     out = attn.to_out[0](out)
     out = attn.to_out[1](out)
