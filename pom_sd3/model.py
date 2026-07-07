@@ -37,7 +37,7 @@ class PomSD3Transformer2DModel(
     """
 
     _supports_gradient_checkpointing = True
-    _no_split_modules = ["JointPoMBlock", "JointLocalAttnBlock"]
+    _no_split_modules = ["JointPoMBlock", "JointTransformerBlock"]
     _skip_layerwise_casting_patterns = ["pos_embed", "norm"]
 
     @register_to_config
@@ -115,11 +115,11 @@ class PomSD3Transformer2DModel(
                     return JointTransformerBlock(**common)
                 return JointPoMBlock(**common, **pom_kwargs)
             elif hybrid_n == 0:
-                return JointLocalAttnBlock(**common, **local_kwargs)
+                return JointTransformerBlock(**common)
             else:
                 if i % hybrid_n == 0:
                     return JointPoMBlock(**common, **pom_kwargs)
-                return JointLocalAttnBlock(**common, **local_kwargs)
+                return JointTransformerBlock(**common)
 
         self.transformer_blocks = nn.ModuleList([_make_block(i) for i in range(num_layers)])
 
