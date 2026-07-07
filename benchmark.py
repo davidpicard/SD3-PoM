@@ -71,6 +71,18 @@ def _time_fwd(model, inputs, warmup: int, repeats: int) -> float:
 def run_bench(label, transformer, pipe, batch_sizes, image_size, steps, device, dtype,
               warmup, repeats):
     print(f"\n--- {label} ---")
+
+    # One warmup generation to trigger torch.compile before timing starts.
+    # The pipeline graph is slightly different from the standalone forward pass,
+    # so the first pipeline call compiles a fresh kernel (takes ~20s on H100).
+    print("  (compile warmup ...)", end="", flush=True)
+    pipe.transformer = transformer
+    with torch.no_grad():
+        pipe(["warmup"], num_inference_steps=1, guidance_scale=4.0,
+             height=image_size, width=image_size, output_type="latent")
+    torch.cuda.synchronize()
+    print(" done")
+
     rows = []
     for bs in batch_sizes:
         print(f"  bs={bs:2d} ...", end="", flush=True)
