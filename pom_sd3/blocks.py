@@ -39,12 +39,14 @@ except ImportError:
 
 # BlockMask cache: (n_img, m, device_str) -> BlockMask
 _BLOCK_MASK_CACHE: dict = {}
-# BLOCK_SIZE=32 divides all typical patch counts: 256, 576, 1024, 2304, 4096
-_FLEX_BLOCK_SIZE = 32
 
 
 def _get_block_mask(n_img: int, m: int, device: torch.device):
-    """Return a cached BlockMask for 2D windowed self-attention on image patches."""
+    """Return a cached BlockMask for 2D windowed self-attention on image patches.
+
+    Uses the default BLOCK_SIZE=128 required by the H100 flex_attention kernel.
+    n_img must be a multiple of 128 (satisfied by 512px → 1024 patches, 1024px → 4096 patches).
+    """
     key = (n_img, m, str(device))
     if key in _BLOCK_MASK_CACHE:
         return _BLOCK_MASK_CACHE[key]
@@ -56,10 +58,8 @@ def _get_block_mask(n_img: int, m: int, device: torch.device):
             (torch.abs(q_idx % W  - kv_idx % W)  <= m)
         )
 
-    bm = create_block_mask(
-        mask_mod, B=None, H=None, Q_LEN=n_img, KV_LEN=n_img,
-        device=device, BLOCK_SIZE=_FLEX_BLOCK_SIZE,
-    )
+    # BLOCK_SIZE defaults to 128 (PyTorch default, required by H100 kernel tiles).
+    bm = create_block_mask(mask_mod, B=None, H=None, Q_LEN=n_img, KV_LEN=n_img, device=device)
     _BLOCK_MASK_CACHE[key] = bm
     return bm
 
