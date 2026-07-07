@@ -23,10 +23,10 @@ INIT_FROM=""   # set to previous phase final dir when starting a new resolution 
 rm -f "$OUTPUT_DIR/.save_and_exit"   # clear any stale sentinel from a previous run
 
 _requeue() {
-    if [ -d "$OUTPUT_DIR/final" ]; then
-        echo "$(date): Training complete — skipping requeue."
-        return
-    fi
+    # Always flag for checkpoint save — do NOT check for final/ here.
+    # final/ may exist from a previous run with a lower --max_steps, so its
+    # presence doesn't mean the current run is done.  The post-srun check
+    # below handles the skip-requeue logic once Python has actually exited.
     echo "$(date): Wall time approaching — flagging for checkpoint save ..."
     touch "$OUTPUT_DIR/.save_and_exit"
     # scontrol requeue is NOT called here: it kills the job immediately,
