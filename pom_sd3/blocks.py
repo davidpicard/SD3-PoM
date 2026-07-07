@@ -18,6 +18,144 @@ from pom.pom_rope import PoMRoPE
 
 from .masks import build_joint_mask
 
+# ---------------------------------------------------------------------------
+# flex_attention fast path for windowed local attention
+# ---------------------------------------------------------------------------
+
+try:
+    from torch.nn.attention.flex_attention import (
+        flex_attention as _flex_attn,
+        create_block_mask,
+    )
+    _FLEX_AVAILABLE = True
+except ImportError:
+    _FLEX_AVAILABLE = False
+
+# BlockMask cache: (n_img, m, device_str) -> BlockMask
+_BLOCK_MASK_CACHE: dict = {}
+# BLOCK_SIZE=32 divides all typical patch counts: 256, 576, 1024, 2304, 4096
+_FLEX_BLOCK_SIZE = 32
+
+
+def _get_block_mask(n_img: int, m: int, device: torch.device):
+    """Return a cached BlockMask for 2D windowed self-attention on image patches."""
+    key = (n_img, m, str(device))
+    if key in _BLOCK_MASK_CACHE:
+        return _BLOCK_MASK_CACHE[key]
+    W = int(math.isqrt(n_img))
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        return (
+            (torch.abs(q_idx // W - kv_idx // W) <= m) &
+            (torch.abs(q_idx % W  - kv_idx % W)  <= m)
+        )
+
+    bm = create_block_mask(
+        mask_mod, B=None, H=None, Q_LEN=n_img, KV_LEN=n_img,
+        device=device, BLOCK_SIZE=_FLEX_BLOCK_SIZE,
+    )
+    _BLOCK_MASK_CACHE[key] = bm
+    return bm
+
+
+def _qkv(attn, norm_img, norm_txt, B, n_img, n_txt, H, d, context_pre_only: bool):
+    """Project and RMS-norm Q/K/V for image and text modalities."""
+    q_img = attn.to_q(norm_img).view(B, n_img, H, d).transpose(1, 2)
+    k_img = attn.to_k(norm_img).view(B, n_img, H, d).transpose(1, 2)
+    v_img = attn.to_v(norm_img).view(B, n_img, H, d).transpose(1, 2)
+    k_txt = attn.add_k_proj(norm_txt).view(B, n_txt, H, d).transpose(1, 2)
+    v_txt = attn.add_v_proj(norm_txt).view(B, n_txt, H, d).transpose(1, 2)
+    q_txt = (None if context_pre_only
+             else attn.add_q_proj(norm_txt).view(B, n_txt, H, d).transpose(1, 2))
+    if attn.norm_q is not None:
+        q_img = attn.norm_q(q_img)
+        if q_txt is not None:
+            q_txt = attn.norm_added_q(q_txt)
+    if attn.norm_k is not None:
+        k_img = attn.norm_k(k_img)
+        k_txt = attn.norm_added_k(k_txt)
+    return q_img, k_img, v_img, q_txt, k_txt, v_txt
+
+
+def _merge_lse(out1, lse1, out2, lse2, dtype):
+    """Combine two partial attention outputs via the online-softmax LSE formula.
+
+    Equivalent to a single softmax over the union of both key sets.
+    lse1, lse2: [B, H, N] float32.  out1, out2: [B, H, N, D].
+    """
+    m = torch.maximum(lse1, lse2)
+    w1 = torch.exp(lse1 - m).unsqueeze(-1)   # [B, H, N, 1]
+    w2 = torch.exp(lse2 - m).unsqueeze(-1)
+    return ((out1.float() * w1 + out2.float() * w2) / (w1 + w2)).to(dtype)
+
+
+def _joint_local_flex(attn, norm_img, norm_txt, n_img, n_txt, window_m, device, dtype):
+    """Windowed joint attention using flex_attention + SDPA cross-attention.
+
+    Image tokens: windowed img→img (flex_attn) + global img→txt (SDPA), merged via LSE.
+    Text tokens : global Q_txt → [img, txt] (SDPA). Omitted when context_pre_only.
+    Mathematically equivalent to joint attention with the windowed mask.
+    """
+    B = norm_img.shape[0]
+    H, d = attn.heads, attn.inner_dim // attn.heads
+    cpo = attn.context_pre_only
+
+    q_img, k_img, v_img, q_txt, k_txt, v_txt = _qkv(
+        attn, norm_img, norm_txt, B, n_img, n_txt, H, d, cpo
+    )
+
+    # --- Image → windowed image (flex_attn, O(N·w)) ---
+    bm = _get_block_mask(n_img, window_m, device)
+    out_local, lse_local = _flex_attn(q_img, k_img, v_img, block_mask=bm, return_lse=True)
+    # out_local: [B, H, N_img, D];  lse_local: [B, H, N_img] float32
+
+    # --- Image → all text (SDPA, N_txt=154 is small, no mask needed) ---
+    scale = d ** -0.5
+    cross = (q_img @ k_txt.transpose(-2, -1)) * scale          # [B, H, N_img, N_txt]
+    lse_cross = torch.logsumexp(cross.float(), dim=-1)          # [B, H, N_img] float32
+    out_cross = torch.softmax(cross, dim=-1) @ v_txt            # [B, H, N_img, D]
+
+    # Merge: equivalent to softmax over windowed-img ∪ all-txt keys
+    out_img = _merge_lse(out_local, lse_local, out_cross, lse_cross, dtype)
+
+    # Output projection for image
+    out_img = out_img.transpose(1, 2).reshape(B, n_img, H * d)
+    out_img = attn.to_out[0](out_img)
+    out_img = attn.to_out[1](out_img)
+
+    if cpo:
+        return out_img, None
+
+    # --- Text → all (image + text), global SDPA ---
+    k_all = torch.cat([k_img, k_txt], dim=2)   # [B, H, N_img+N_txt, D]
+    v_all = torch.cat([v_img, v_txt], dim=2)
+    out_txt = F.scaled_dot_product_attention(q_txt, k_all, v_all)
+    out_txt = out_txt.transpose(1, 2).reshape(B, n_txt, H * d)
+    out_txt = attn.to_add_out(out_txt)
+
+    return out_img, out_txt
+
+
+def _img_local_flex(attn, norm_img, n_img, window_m, device, dtype):
+    """Windowed image-only attention via flex_attention (for dual-attention attn2)."""
+    B = norm_img.shape[0]
+    H, d = attn.heads, attn.inner_dim // attn.heads
+
+    q = attn.to_q(norm_img).view(B, n_img, H, d).transpose(1, 2)
+    k = attn.to_k(norm_img).view(B, n_img, H, d).transpose(1, 2)
+    v = attn.to_v(norm_img).view(B, n_img, H, d).transpose(1, 2)
+    if attn.norm_q is not None:
+        q = attn.norm_q(q)
+    if attn.norm_k is not None:
+        k = attn.norm_k(k)
+
+    bm = _get_block_mask(n_img, window_m, device)
+    out = _flex_attn(q, k, v, block_mask=bm)
+    out = out.transpose(1, 2).reshape(B, n_img, H * d)
+    out = attn.to_out[0](out)
+    out = attn.to_out[1](out)
+    return out
+
 
 
 @maybe_allow_in_graph
@@ -268,17 +406,18 @@ class JointLocalAttnProcessor:
             key = attn.norm_k(key)
 
         if encoder_hidden_states is not None:
-            enc_q = attn.add_q_proj(encoder_hidden_states)
             enc_k = attn.add_k_proj(encoder_hidden_states)
             enc_v = attn.add_v_proj(encoder_hidden_states)
-            enc_q = enc_q.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
             enc_k = enc_k.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
             enc_v = enc_v.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-            if attn.norm_added_q is not None:
-                enc_q = attn.norm_added_q(enc_q)
             if attn.norm_added_k is not None:
                 enc_k = attn.norm_added_k(enc_k)
-            query = torch.cat([query, enc_q], dim=2)
+            if not attn.context_pre_only:
+                enc_q = attn.add_q_proj(encoder_hidden_states)
+                enc_q = enc_q.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+                if attn.norm_added_q is not None:
+                    enc_q = attn.norm_added_q(enc_q)
+                query = torch.cat([query, enc_q], dim=2)
             key   = torch.cat([key,   enc_k], dim=2)
             value = torch.cat([value, enc_v], dim=2)
 
@@ -408,9 +547,14 @@ class JointLocalAttnBlock(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         n_img = hidden_states.shape[1]
         n_txt = encoder_hidden_states.shape[1]
-        joint_mask, img_mask = self._get_masks(
-            n_img, n_txt, hidden_states.device, hidden_states.dtype
-        )
+        device, dtype = hidden_states.device, hidden_states.dtype
+
+        # Masks only needed for the SDPA fallback path.
+        if not _FLEX_AVAILABLE:
+            joint_mask, img_mask = self._get_masks(n_img, n_txt, device, dtype)
+            # When context_pre_only only image tokens are queries → slice mask rows.
+            if self.context_pre_only:
+                joint_mask = joint_mask[:, :, :n_img, :]
 
         # --- Normalize ---
         if self.use_dual_attention:
@@ -430,19 +574,30 @@ class JointLocalAttnBlock(nn.Module):
             )
 
         # --- Joint local attention ---
-        attn_output, context_attn_output = self.attn(
-            hidden_states=norm_hidden_states,
-            encoder_hidden_states=norm_encoder_hidden_states,
-            attention_mask=joint_mask,
-        )
+        if _FLEX_AVAILABLE:
+            attn_output, context_attn_output = _joint_local_flex(
+                self.attn, norm_hidden_states, norm_encoder_hidden_states,
+                n_img, n_txt, self.window_m, device, dtype,
+            )
+        else:
+            attn_output, context_attn_output = self.attn(
+                hidden_states=norm_hidden_states,
+                encoder_hidden_states=norm_encoder_hidden_states,
+                attention_mask=joint_mask,
+            )
         hidden_states = hidden_states + gate_msa.unsqueeze(1) * attn_output
 
         # --- Dual image-only local attention ---
         if self.use_dual_attention:
-            attn_output2 = self.attn2(
-                hidden_states=norm_hidden_states2,
-                attention_mask=img_mask,
-            )
+            if _FLEX_AVAILABLE:
+                attn_output2 = _img_local_flex(
+                    self.attn2, norm_hidden_states2, n_img, self.window_m, device, dtype,
+                )
+            else:
+                attn_output2 = self.attn2(
+                    hidden_states=norm_hidden_states2,
+                    attention_mask=img_mask,
+                )
             hidden_states = hidden_states + gate_msa2.unsqueeze(1) * attn_output2
 
         # --- Image FF ---
