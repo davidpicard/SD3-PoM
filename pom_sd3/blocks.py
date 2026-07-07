@@ -32,7 +32,7 @@ try:
         _FLEX_USE_AUX = True
     except ImportError:
         _FLEX_USE_AUX = False  # older PyTorch: use return_lse instead
-    _flex_attn = torch.compile(_flex_attn_raw)
+    _flex_attn = torch.compile(_flex_attn_raw, dynamic=True)
     _FLEX_AVAILABLE = True
 except ImportError:
     _FLEX_AVAILABLE = False
