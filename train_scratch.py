@@ -392,13 +392,7 @@ class GPicDataset(torch.utils.data.IterableDataset):
         dataset_dir: str | None = None,
     ):
         self._caption_type = caption_type if caption_type != "all" else None
-        self._preprocess = transforms.Compose([
-            transforms.Resize(image_size,
-                              interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.CenterCrop(image_size),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
-        ])
+        self._image_size = image_size
 
         if dataset_dir:
             import glob as _glob
@@ -417,6 +411,22 @@ class GPicDataset(torch.utils.data.IterableDataset):
                 hf_ds = hf_ds.shard(num_shards=world_size, index=rank)
             self._ds = hf_ds
             self._tar_files = None
+
+    def _preprocess_img(self, img):
+        orig_w, orig_h = img.size  # PIL: (W, H)
+        img = transforms.functional.resize(
+            img, self._image_size,
+            interpolation=transforms.InterpolationMode.BICUBIC,
+        )
+        i, j, h, w = transforms.RandomCrop.get_params(
+            img, (self._image_size, self._image_size)
+        )
+        img = transforms.functional.crop(img, i, j, h, w)
+        img = transforms.functional.to_tensor(img)
+        img = transforms.functional.normalize(img, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+        # (i, j) = (top, left) in the resized image's pixel coords
+        crop_str = f"[crop: {orig_h}x{orig_w}, offset: {i},{j}]"
+        return img, crop_str
 
     def __iter__(self):
         if self._tar_files is not None:
@@ -454,9 +464,11 @@ class GPicDataset(torch.utils.data.IterableDataset):
                                     continue
                                 if not caption:
                                     continue
+                                pixel_values, crop_str = self._preprocess_img(img)
                                 yield {
-                                    "pixel_values": self._preprocess(img),
+                                    "pixel_values": pixel_values,
                                     "caption": caption,
+                                    "crop_str": crop_str,
                                 }
                 except Exception:
                     continue
@@ -472,17 +484,22 @@ class GPicDataset(torch.utils.data.IterableDataset):
                     continue
                 if self._caption_type and sample.get("caption_type") != self._caption_type:
                     continue
+                pixel_values, crop_str = self._preprocess_img(img)
                 yield {
-                    "pixel_values": self._preprocess(img),
+                    "pixel_values": pixel_values,
                     "caption": caption,
+                    "crop_str": crop_str,
                 }
 
 
 def gpic_collate(batch: list[dict]) -> dict:
-    return {
+    result = {
         "pixel_values": torch.stack([b["pixel_values"] for b in batch]),
         "caption": [b["caption"] for b in batch],
     }
+    if "crop_str" in batch[0]:
+        result["crop_str"] = [b["crop_str"] for b in batch]
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -612,6 +629,15 @@ def parse_args():
     p.add_argument("--caption_dropout", type=float, default=0.1,
                    help="Fraction of captions replaced with empty string for CFG training "
                         "(trains the unconditional score; required for guidance_scale > 1 at inference)")
+    p.add_argument("--crop_str_dropout", type=float, default=0.1,
+                   help="Probability of NOT appending the crop info string to captions "
+                        "(0=always append, 1=never; 0.1 means model sees it 90%% of the time)")
+    p.add_argument("--logit_normal_mean", type=float, default=None,
+                   help="Mean of the logit-normal timestep distribution. "
+                        "Default: log(ref_image_size/image_size) — shifts sampling towards "
+                        "high-noise steps at lower resolutions. Pass 0.0 for standard SD3.")
+    p.add_argument("--ref_image_size", type=int, default=1024,
+                   help="Reference resolution for auto logit-normal mean (default 1024)")
     p.add_argument("--max_steps", type=int, default=500_000)
     p.add_argument("--warmup_steps", type=int, default=2_000)
 
@@ -637,6 +663,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.logit_normal_mean is None:
+        args.logit_normal_mean = math.log(args.ref_image_size / args.image_size)
     local_rank = setup_ddp()
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -863,6 +891,14 @@ def main():
         captions = batch["caption"]
         B = pixel_values.shape[0]
 
+        # Append crop info string to captions (dropped with probability crop_str_dropout)
+        crop_strs = batch.get("crop_str")
+        if crop_strs is not None and args.crop_str_dropout < 1.0:
+            captions = [
+                cap + " " + cs if random.random() > args.crop_str_dropout else cap
+                for cap, cs in zip(captions, crop_strs)
+            ]
+
         # --- Encode image → latent x_0 ---
         if vae is not None:
             with torch.no_grad():
@@ -897,9 +933,10 @@ def main():
             pooled = torch.randn(B, 2048, device=device, dtype=torch.bfloat16)
 
         # --- Flow matching loss ---
-        # Logit-normal timestep sampling (SD3): concentrates training near t≈500 where
-        # global structure is established, vs uniform which underweights mid-noise steps.
-        u = torch.sigmoid(torch.randn(B, device=device))
+        # Logit-normal timestep sampling with resolution-adjusted mean.
+        # mean=0: standard SD3 (concentrates at t≈500).
+        # mean>0: shifts towards high t (global structure); used at lower resolutions.
+        u = torch.sigmoid(torch.randn(B, device=device) + args.logit_normal_mean)
         t = (u * 999).clamp(1, 999).long()
         sigma = (t.float() / 1000).view(B, 1, 1, 1)
         eps = torch.randn_like(x_0)
@@ -912,7 +949,8 @@ def main():
             timestep=t,
         ).sample
         v_target = (eps - x_0).to(v_pred.dtype)
-        loss = F.mse_loss(v_pred, v_target)
+        loss_per = F.mse_loss(v_pred, v_target, reduction="none").mean(dim=(1, 2, 3))
+        loss = loss_per.mean()
 
         (loss / args.grad_accum_steps).backward()
 
@@ -930,8 +968,16 @@ def main():
         if is_main() and step % args.log_every == 0:
             elapsed = time.time() - t0
             sps = (step + 1 - start_step) * args.batch_size * world_size / elapsed
+            t_cpu = t.cpu().float()
+            lp = loss_per.detach().cpu()
+            low  = t_cpu < 334
+            mid  = (t_cpu >= 334) & (t_cpu < 667)
+            high = t_cpu >= 667
             log = {
-                "loss": loss.item(),
+                "loss":        loss.item(),
+                "loss_low_t":  lp[low].mean().item()  if low.any()  else float("nan"),
+                "loss_mid_t":  lp[mid].mean().item()  if mid.any()  else float("nan"),
+                "loss_high_t": lp[high].mean().item() if high.any() else float("nan"),
                 "lr": lr,
                 "step": step,
                 "samples_per_sec": sps,
