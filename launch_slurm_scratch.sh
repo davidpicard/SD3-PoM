@@ -64,6 +64,7 @@ srun torchrun \
         --batch_size 2 \
         --grad_accum_steps 4 \
         --lr 1e-4 \
+        --caption_dropout 0.1 \
         --warmup_steps 2000 \
         --max_steps 500000 \
         --log_every 50 \

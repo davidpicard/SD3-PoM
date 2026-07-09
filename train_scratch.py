@@ -609,6 +609,9 @@ def parse_args():
     p.add_argument("--grad_accum_steps", type=int, default=1)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=1e-2)
+    p.add_argument("--caption_dropout", type=float, default=0.1,
+                   help="Fraction of captions replaced with empty string for CFG training "
+                        "(trains the unconditional score; required for guidance_scale > 1 at inference)")
     p.add_argument("--max_steps", type=int, default=500_000)
     p.add_argument("--warmup_steps", type=int, default=2_000)
 
@@ -701,8 +704,19 @@ def main():
         for encoder in (text_pipe.text_encoder, text_pipe.text_encoder_2, text_pipe.text_encoder_3):
             if encoder is not None:
                 encoder.requires_grad_(False)
+        # Pre-compute null (unconditional) embeddings for CFG dropout — done once, reused every step.
+        if args.caption_dropout > 0:
+            with torch.no_grad(), _silence_encoding_noise():
+                null_enc_hs, _, null_pooled, _ = text_pipe.encode_prompt(
+                    prompt=[""], prompt_2=[""], prompt_3=[""],
+                )
+            null_enc_hs = null_enc_hs.to(device=device, dtype=torch.bfloat16)
+            null_pooled = null_pooled.to(device=device, dtype=torch.bfloat16)
+        else:
+            null_enc_hs = null_pooled = None
     else:
         text_pipe = None
+        null_enc_hs = null_pooled = None
 
     # --- Model ---
     num_layers = 24  # SD3.5 Medium
@@ -869,13 +883,24 @@ def main():
                 )
             enc_hs = enc_hs.to(dtype=torch.bfloat16)
             pooled = pooled.to(dtype=torch.bfloat16)
+            # CFG conditioning dropout: randomly replace captions with null embedding so
+            # the model learns the unconditional score (required for guidance_scale > 1).
+            if args.caption_dropout > 0 and null_enc_hs is not None:
+                drop = torch.rand(B) < args.caption_dropout
+                if drop.any():
+                    n = int(drop.sum())
+                    enc_hs[drop] = null_enc_hs.expand(n, -1, -1)
+                    pooled[drop] = null_pooled.expand(n, -1)
         else:
             # smoke test: random embeddings
             enc_hs = torch.randn(B, 8, 4096, device=device, dtype=torch.bfloat16)
             pooled = torch.randn(B, 2048, device=device, dtype=torch.bfloat16)
 
         # --- Flow matching loss ---
-        t = torch.randint(1, 999, (B,), device=device)
+        # Logit-normal timestep sampling (SD3): concentrates training near t≈500 where
+        # global structure is established, vs uniform which underweights mid-noise steps.
+        u = torch.sigmoid(torch.randn(B, device=device))
+        t = (u * 999).clamp(1, 999).long()
         sigma = (t.float() / 1000).view(B, 1, 1, 1)
         eps = torch.randn_like(x_0)
         x_t = ((1 - sigma) * x_0 + sigma * eps).to(x_0.dtype)
