@@ -254,6 +254,7 @@ def wrap_model_fsdp(model: torch.nn.Module, local_rank: int) -> torch.nn.Module:
     """Wrap model in FSDP with FULL_SHARD when running distributed; no-op otherwise."""
     if not dist.is_initialized():
         return model
+    from diffusers.models.attention import JointTransformerBlock
     from pom_sd3.blocks import JointPoMBlock
     mp = MixedPrecision(
         param_dtype=torch.bfloat16,
@@ -262,7 +263,7 @@ def wrap_model_fsdp(model: torch.nn.Module, local_rank: int) -> torch.nn.Module:
     )
     wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
-        transformer_layer_cls={JointPoMBlock},
+        transformer_layer_cls={JointPoMBlock, JointTransformerBlock},
     )
     return FSDP(
         model,
@@ -649,6 +650,8 @@ def parse_args():
     p.add_argument("--wandb_project", default="sd3-pom-scratch")
     p.add_argument("--wandb_run_name", default=None)
     p.add_argument("--wandb_offline", action="store_true")
+    p.add_argument("--num_workers", type=int, default=4,
+                   help="DataLoader worker processes for image loading and preprocessing")
     p.add_argument("--gradient_checkpointing", action="store_true",
                    help="Recompute per-block activations to reduce activation memory "
                         "(~30%% extra compute; recommended at 1024px+)")
@@ -718,6 +721,7 @@ def main():
         for p in vae.parameters():
             p.requires_grad_(False)
         vae.eval()
+        vae = torch.compile(vae, dynamic=False)
     else:
         vae = None
 
@@ -732,6 +736,14 @@ def main():
         for encoder in (text_pipe.text_encoder, text_pipe.text_encoder_2, text_pipe.text_encoder_3):
             if encoder is not None:
                 encoder.requires_grad_(False)
+        # Compile text encoders: CLIP has fixed 77-token inputs (dynamic=False);
+        # T5 has variable-length captions (dynamic=True).
+        if text_pipe.text_encoder is not None:
+            text_pipe.text_encoder = torch.compile(text_pipe.text_encoder, dynamic=False)
+        if text_pipe.text_encoder_2 is not None:
+            text_pipe.text_encoder_2 = torch.compile(text_pipe.text_encoder_2, dynamic=False)
+        if text_pipe.text_encoder_3 is not None:
+            text_pipe.text_encoder_3 = torch.compile(text_pipe.text_encoder_3, dynamic=True)
         # Pre-compute null (unconditional) embeddings for CFG dropout — done once, reused every step.
         if args.caption_dropout > 0:
             with torch.no_grad(), _silence_encoding_noise():
@@ -864,7 +876,7 @@ def main():
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        num_workers=0 if args.smoke_test else 4,
+        num_workers=0 if args.smoke_test else args.num_workers,
         pin_memory=not args.smoke_test,
         collate_fn=gpic_collate,
     )
@@ -922,7 +934,7 @@ def main():
             # CFG conditioning dropout: randomly replace captions with null embedding so
             # the model learns the unconditional score (required for guidance_scale > 1).
             if args.caption_dropout > 0 and null_enc_hs is not None:
-                drop = torch.rand(B) < args.caption_dropout
+                drop = torch.rand(B, device=device) < args.caption_dropout
                 if drop.any():
                     n = int(drop.sum())
                     enc_hs[drop] = null_enc_hs.expand(n, -1, -1)
