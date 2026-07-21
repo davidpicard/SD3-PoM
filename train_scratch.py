@@ -954,19 +954,27 @@ def main():
         eps = torch.randn_like(x_0)
         x_t = ((1 - sigma) * x_0 + sigma * eps).to(x_0.dtype)
 
-        v_pred = model(
-            hidden_states=x_t,
-            encoder_hidden_states=enc_hs,
-            pooled_projections=pooled,
-            timestep=t,
-        ).sample
-        v_target = (eps - x_0).to(v_pred.dtype)
-        loss_per = F.mse_loss(v_pred, v_target, reduction="none").mean(dim=(1, 2, 3))
-        loss = loss_per.mean()
+        # Suppress FSDP gradient reduce-scatter on all but the last micro-batch so
+        # that the collective fires once per optimizer step, not once per backward.
+        is_last_accum = (step + 1) % args.grad_accum_steps == 0
+        sync_ctx = (
+            contextlib.nullcontext()
+            if not isinstance(model, FSDP) or is_last_accum
+            else model.no_sync()
+        )
+        with sync_ctx:
+            v_pred = model(
+                hidden_states=x_t,
+                encoder_hidden_states=enc_hs,
+                pooled_projections=pooled,
+                timestep=t,
+            ).sample
+            v_target = (eps - x_0).to(v_pred.dtype)
+            loss_per = F.mse_loss(v_pred, v_target, reduction="none").mean(dim=(1, 2, 3))
+            loss = loss_per.mean()
+            (loss / args.grad_accum_steps).backward()
 
-        (loss / args.grad_accum_steps).backward()
-
-        if (step + 1) % args.grad_accum_steps == 0:
+        if is_last_accum:
             # FSDP handles gradient synchronisation internally; clip using its
             # all-ranks norm computation.  Plain model falls back to the standard call.
             if isinstance(model, FSDP):
