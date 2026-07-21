@@ -250,8 +250,16 @@ def cleanup_ddp():
         dist.destroy_process_group()
 
 
-def wrap_model_fsdp(model: torch.nn.Module, local_rank: int) -> torch.nn.Module:
-    """Wrap model in FSDP with FULL_SHARD when running distributed; no-op otherwise."""
+def wrap_model_fsdp(model: torch.nn.Module, local_rank: int,
+                    gpus_per_node: int | None = None) -> torch.nn.Module:
+    """Wrap model in FSDP.
+
+    gpus_per_node=None  → FULL_SHARD across all ranks (default; one flat shard group).
+    gpus_per_node=N     → HYBRID_SHARD: shard within each N-GPU node over NVLink,
+                          average gradients across nodes once per optimizer step.
+                          Reduces cross-node InfiniBand traffic from O(layers) to O(1)
+                          at the cost of N× more parameters per GPU than FULL_SHARD.
+    """
     if not dist.is_initialized():
         return model
     from diffusers.models.attention import JointTransformerBlock
@@ -265,6 +273,30 @@ def wrap_model_fsdp(model: torch.nn.Module, local_rank: int) -> torch.nn.Module:
         transformer_auto_wrap_policy,
         transformer_layer_cls={JointPoMBlock, JointTransformerBlock},
     )
+
+    if gpus_per_node is not None and gpus_per_node < dist.get_world_size():
+        # Build within-node (shard) and cross-node (replicate) process groups.
+        rank = dist.get_rank()
+        ws   = dist.get_world_size()
+        node_idx    = rank // gpus_per_node
+        num_nodes   = ws   // gpus_per_node
+        intra_ranks = list(range(node_idx * gpus_per_node,
+                                 (node_idx + 1) * gpus_per_node))
+        inter_ranks = list(range(rank % gpus_per_node, ws, gpus_per_node))
+        intra_group = dist.new_group(intra_ranks)   # NVLink shard group
+        inter_group = dist.new_group(inter_ranks)   # InfiniBand replicate group
+        if is_main():
+            print(f"HYBRID_SHARD: {gpus_per_node} GPUs/node × {num_nodes} nodes "
+                  f"(shard within node, replicate across nodes)")
+        return FSDP(
+            model,
+            sharding_strategy=ShardingStrategy.HYBRID_SHARD,
+            process_group=(intra_group, inter_group),
+            auto_wrap_policy=wrap_policy,
+            mixed_precision=mp,
+            device_id=local_rank,
+        )
+
     return FSDP(
         model,
         sharding_strategy=ShardingStrategy.FULL_SHARD,
@@ -658,6 +690,11 @@ def parse_args():
     p.add_argument("--gradient_checkpointing", action="store_true",
                    help="Recompute per-block activations to reduce activation memory "
                         "(~30%% extra compute; recommended at 1024px+)")
+    p.add_argument("--gpus_per_node", type=int, default=None,
+                   help="Enable FSDP HYBRID_SHARD: shard within each node over NVLink, "
+                        "average gradients across nodes once per step via DDP all-reduce. "
+                        "Set to the number of GPUs per node (e.g. 4 for 4×H100). "
+                        "Reduces cross-node InfiniBand traffic from O(layers) to O(1).")
     p.add_argument("--smoke_test", action="store_true",
                    help="5 steps on random data with tiny model, then exit")
     return p.parse_args()
@@ -825,7 +862,7 @@ def main():
 
     # FSDP wrapping shards params, grads, and optimizer states across ranks.
     # Must happen before optimizer creation so the optimizer sees sharded params.
-    model = wrap_model_fsdp(model, local_rank)
+    model = wrap_model_fsdp(model, local_rank, gpus_per_node=args.gpus_per_node)
     model.train()
 
     # --- Optimizer (created on sharded params when FSDP is active) ---
