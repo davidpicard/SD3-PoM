@@ -630,6 +630,9 @@ def parse_args():
     p.add_argument("--caption_dropout", type=float, default=0.1,
                    help="Fraction of captions replaced with empty string for CFG training "
                         "(trains the unconditional score; required for guidance_scale > 1 at inference)")
+    p.add_argument("--max_sequence_length", type=int, default=77,
+                   help="Max T5 token length per caption. SD3 default is 256 but 77 is 3-4x faster "
+                        "and sufficient for most captions. Use 256 for final quality runs.")
     p.add_argument("--crop_str_dropout", type=float, default=0.1,
                    help="Probability of NOT appending the crop info string to captions "
                         "(0=always append, 1=never; 0.1 means model sees it 90%% of the time)")
@@ -736,12 +739,12 @@ def main():
         for encoder in (text_pipe.text_encoder, text_pipe.text_encoder_2, text_pipe.text_encoder_3):
             if encoder is not None:
                 encoder.requires_grad_(False)
-        # Compile text encoders: CLIP has fixed 77-token inputs (dynamic=False);
-        # T5 has variable-length captions (dynamic=True).
+        # Compile text encoders with dynamic=True throughout: null encoding runs at bs=1,
+        # training runs at --batch_size; dynamic=False would recompile at the first training step.
         if text_pipe.text_encoder is not None:
-            text_pipe.text_encoder = torch.compile(text_pipe.text_encoder, dynamic=False)
+            text_pipe.text_encoder = torch.compile(text_pipe.text_encoder, dynamic=True)
         if text_pipe.text_encoder_2 is not None:
-            text_pipe.text_encoder_2 = torch.compile(text_pipe.text_encoder_2, dynamic=False)
+            text_pipe.text_encoder_2 = torch.compile(text_pipe.text_encoder_2, dynamic=True)
         if text_pipe.text_encoder_3 is not None:
             text_pipe.text_encoder_3 = torch.compile(text_pipe.text_encoder_3, dynamic=True)
         # Pre-compute null (unconditional) embeddings for CFG dropout — done once, reused every step.
@@ -749,6 +752,7 @@ def main():
             with torch.no_grad(), _silence_encoding_noise():
                 null_enc_hs, _, null_pooled, _ = text_pipe.encode_prompt(
                     prompt=[""], prompt_2=[""], prompt_3=[""],
+                    max_sequence_length=args.max_sequence_length,
                 )
             null_enc_hs = null_enc_hs.to(device=device, dtype=torch.bfloat16)
             null_pooled = null_pooled.to(device=device, dtype=torch.bfloat16)
@@ -928,6 +932,7 @@ def main():
             with torch.no_grad(), _silence_encoding_noise():
                 enc_hs, _, pooled, _ = text_pipe.encode_prompt(
                     prompt=captions, prompt_2=captions, prompt_3=captions,
+                    max_sequence_length=args.max_sequence_length,
                 )
             enc_hs = enc_hs.to(dtype=torch.bfloat16)
             pooled = pooled.to(dtype=torch.bfloat16)
