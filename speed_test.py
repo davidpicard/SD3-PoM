@@ -67,14 +67,22 @@ def wrap_model_fsdp(model, local_rank, gpus_per_node=None):
     )
     ws = world_size()
     if gpus_per_node is not None and gpus_per_node < ws:
-        rank = dist.get_rank()
-        node_idx    = rank // gpus_per_node
-        intra_ranks = list(range(node_idx * gpus_per_node, (node_idx + 1) * gpus_per_node))
-        inter_ranks = list(range(rank % gpus_per_node, ws, gpus_per_node))
-        intra_group = dist.new_group(intra_ranks)
-        inter_group = dist.new_group(inter_ranks)
+        rank      = dist.get_rank()
+        num_nodes = ws // gpus_per_node
+        node_idx  = rank // gpus_per_node
+
+        all_intra = []
+        for n in range(num_nodes):
+            all_intra.append(dist.new_group(list(range(n * gpus_per_node,
+                                                       (n + 1) * gpus_per_node))))
+        all_inter = []
+        for g in range(gpus_per_node):
+            all_inter.append(dist.new_group(list(range(g, ws, gpus_per_node))))
+
+        intra_group = all_intra[node_idx]
+        inter_group = all_inter[rank % gpus_per_node]
         if is_main():
-            print(f"HYBRID_SHARD: {gpus_per_node} GPUs/node × {ws // gpus_per_node} nodes")
+            print(f"HYBRID_SHARD: {gpus_per_node} GPUs/node × {num_nodes} nodes")
         return FSDP(
             model,
             sharding_strategy=ShardingStrategy.HYBRID_SHARD,

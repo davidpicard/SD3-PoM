@@ -276,15 +276,25 @@ def wrap_model_fsdp(model: torch.nn.Module, local_rank: int,
 
     if gpus_per_node is not None and gpus_per_node < dist.get_world_size():
         # Build within-node (shard) and cross-node (replicate) process groups.
-        rank = dist.get_rank()
-        ws   = dist.get_world_size()
-        node_idx    = rank // gpus_per_node
-        num_nodes   = ws   // gpus_per_node
-        intra_ranks = list(range(node_idx * gpus_per_node,
-                                 (node_idx + 1) * gpus_per_node))
-        inter_ranks = list(range(rank % gpus_per_node, ws, gpus_per_node))
-        intra_group = dist.new_group(intra_ranks)   # NVLink shard group
-        inter_group = dist.new_group(inter_ranks)   # InfiniBand replicate group
+        # dist.new_group() is a collective: ALL ranks must call it for EVERY group
+        # in the same order, regardless of membership. Each rank then picks the
+        # group it belongs to.
+        rank      = dist.get_rank()
+        ws        = dist.get_world_size()
+        num_nodes = ws // gpus_per_node
+        node_idx  = rank // gpus_per_node
+
+        all_intra = []
+        for n in range(num_nodes):
+            all_intra.append(dist.new_group(list(range(n * gpus_per_node,
+                                                       (n + 1) * gpus_per_node))))
+        all_inter = []
+        for g in range(gpus_per_node):
+            all_inter.append(dist.new_group(list(range(g, ws, gpus_per_node))))
+
+        intra_group = all_intra[node_idx]
+        inter_group = all_inter[rank % gpus_per_node]
+
         if is_main():
             print(f"HYBRID_SHARD: {gpus_per_node} GPUs/node × {num_nodes} nodes "
                   f"(shard within node, replicate across nodes)")
