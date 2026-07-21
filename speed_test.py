@@ -51,7 +51,7 @@ def world_size():
     return dist.get_world_size() if dist.is_initialized() else 1
 
 
-def wrap_model_fsdp(model, local_rank):
+def wrap_model_fsdp(model, local_rank, gpus_per_node=None):
     if not dist.is_initialized():
         return model
     from diffusers.models.attention import JointTransformerBlock
@@ -65,6 +65,24 @@ def wrap_model_fsdp(model, local_rank):
         transformer_auto_wrap_policy,
         transformer_layer_cls={JointPoMBlock, JointTransformerBlock},
     )
+    ws = world_size()
+    if gpus_per_node is not None and gpus_per_node < ws:
+        rank = dist.get_rank()
+        node_idx    = rank // gpus_per_node
+        intra_ranks = list(range(node_idx * gpus_per_node, (node_idx + 1) * gpus_per_node))
+        inter_ranks = list(range(rank % gpus_per_node, ws, gpus_per_node))
+        intra_group = dist.new_group(intra_ranks)
+        inter_group = dist.new_group(inter_ranks)
+        if is_main():
+            print(f"HYBRID_SHARD: {gpus_per_node} GPUs/node × {ws // gpus_per_node} nodes")
+        return FSDP(
+            model,
+            sharding_strategy=ShardingStrategy.HYBRID_SHARD,
+            process_group=(intra_group, inter_group),
+            auto_wrap_policy=wrap_policy,
+            mixed_precision=mp,
+            device_id=local_rank,
+        )
     return FSDP(
         model,
         sharding_strategy=ShardingStrategy.FULL_SHARD,
@@ -152,6 +170,8 @@ def parse_args():
     p.add_argument("--max_sequence_length", type=int, default=77,
                    help="T5 token budget (SD3 default=256; 77 is the CLIP budget)")
     p.add_argument("--gradient_checkpointing", action="store_true")
+    p.add_argument("--gpus_per_node", type=int, default=None,
+                   help="Enable HYBRID_SHARD: shard within node, replicate across nodes")
     p.add_argument("--no_compile", action="store_true",
                    help="Skip torch.compile on VAE and text encoders")
     p.add_argument("--n_warmup", type=int, default=3,
@@ -217,7 +237,7 @@ def main():
     if args.gradient_checkpointing:
         model.enable_gradient_checkpointing()
 
-    model = wrap_model_fsdp(model, local_rank)
+    model = wrap_model_fsdp(model, local_rank, gpus_per_node=args.gpus_per_node)
     model.train()
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
