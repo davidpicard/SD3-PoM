@@ -287,6 +287,26 @@ def build_grouped_from_sd3_pretrained(
     if surprise:
         print(f"WARNING: {len(surprise)} pretrained keys missing after transfer: {surprise[:5]}")
 
+    # Zero-init AdaLayerNorm gating projections for all random blocks.
+    #
+    # PyTorch default init gives AdaLN gate values of ~0.4, so each random block
+    # adds 0.4 × (random PoM output) to the residual stream at step 0.  After 13
+    # such blocks the residual is dominated by accumulated random noise, the
+    # pretrained front-att signal is buried, and the loss is worse than random
+    # prediction.  Zero-init (AdaLN-Zero from DiT) makes every random block an
+    # identity map at init: gate=0 suppresses PoM/attn output, scale=0 + shift=0
+    # zeroes the FF input.  Training then gradually teaches each block to
+    # contribute, starting from a clean pretrained residual stream.
+    import torch.nn as nn
+    for i in range(n_front_att, student.config.num_layers):
+        blk = student.transformer_blocks[i]
+        for norm_attr in ("norm1", "norm1_context"):
+            norm_mod = getattr(blk, norm_attr, None)
+            if norm_mod is not None and hasattr(norm_mod, "linear"):
+                nn.init.zeros_(norm_mod.linear.weight)
+                if norm_mod.linear.bias is not None:
+                    nn.init.zeros_(norm_mod.linear.bias)
+
     n_pre_params = sum(v.numel() for v in transfer.values())
     n_rand_params = sum(student_sd[k].numel() for k in expected_random)
     print(f"  Transferred {len(transfer)} tensors ({n_pre_params/1e6:.1f}M params): "
