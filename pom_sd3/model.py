@@ -70,6 +70,10 @@ class PomSD3Transformer2DModel(
         # Hybrid mode
         hybrid_n: int = 1,
         attention_window_m: int = 4,
+        # Explicit per-block layout (overrides hybrid_n when non-empty):
+        # pom_layers lists the block indices that should be JointPoMBlock;
+        # all other indices become JointTransformerBlock.
+        pom_layers: tuple[int, ...] = (),
     ):
         super().__init__()
         self.out_channels = out_channels if out_channels is not None else in_channels
@@ -98,6 +102,8 @@ class PomSD3Transformer2DModel(
         )
         local_kwargs = dict(attention_window_m=attention_window_m)
 
+        pom_layers_set = set(pom_layers)
+
         def _make_block(i: int) -> nn.Module:
             common = dict(
                 dim=self.inner_dim,
@@ -107,6 +113,11 @@ class PomSD3Transformer2DModel(
                 qk_norm=qk_norm,
                 use_dual_attention=(i in dual_attention_layers),
             )
+            # Explicit layout takes priority over hybrid_n
+            if pom_layers_set:
+                if i in pom_layers_set:
+                    return JointPoMBlock(**common, **pom_kwargs)
+                return JointTransformerBlock(**common)
             if hybrid_n == 1:
                 # Legacy behaviour: n_pom_blocks controls which blocks are PoM vs full-attn
                 n_pom = num_layers if n_pom_blocks is None else n_pom_blocks

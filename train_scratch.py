@@ -49,7 +49,7 @@ from diffusers import (
 from torchvision import transforms
 
 from pom_sd3 import PomSD3Transformer2DModel
-from pom_sd3.convert import SD35_MEDIUM_CONFIG
+from pom_sd3.convert import SD35_MEDIUM_CONFIG, build_grouped_from_sd3_pretrained
 
 
 # ---------------------------------------------------------------------------
@@ -321,6 +321,99 @@ def lr_schedule(step: int, warmup_steps: int, max_steps: int, base_lr: float) ->
         return base_lr * step / max(1, warmup_steps)
     progress = (step - warmup_steps) / max(1, max_steps - warmup_steps)
     return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+def two_phase_lr(
+    step: int,
+    phase1_steps: int,
+    warmup_steps: int,
+    max_steps: int,
+    base_lr: float,
+    pretrained_lr_scale: float,
+) -> tuple[float, float]:
+    """Return (pretrained_lr, random_lr) for the two-phase warmup schedule.
+
+    Phase 1 (0 → phase1_steps):       random warms up 0→base_lr; pretrained frozen (lr=0).
+    Phase 2 (phase1_steps → warmup):   random at base_lr; pretrained warms up 0→base_lr*scale.
+    After warmup:                       random cosine-decays; pretrained constant at base_lr*scale.
+
+    The freeze in phase 1 prevents large PoM-noise gradients from immediately
+    corrupting the pretrained front-att weights before the PoM blocks stabilise.
+    """
+    if step < phase1_steps:
+        rand_lr = base_lr * step / max(1, phase1_steps)
+        pre_lr = 0.0
+    elif step < warmup_steps:
+        rand_lr = base_lr
+        pre_lr = base_lr * pretrained_lr_scale * (step - phase1_steps) / max(1, warmup_steps - phase1_steps)
+    else:
+        progress = (step - warmup_steps) / max(1, max_steps - warmup_steps)
+        rand_lr = base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
+        pre_lr = base_lr * pretrained_lr_scale
+    return pre_lr, rand_lr
+
+
+def _make_grouped_param_groups(
+    model: torch.nn.Module,
+    n_pretrained_blocks: int,
+    lr: float,
+    lr_scale: float,
+) -> list[dict]:
+    """Two optimizer param groups: pretrained (low lr) and random (full lr).
+
+    Pretrained group: pos_embed, time_text_embed, context_embedder, norm_out,
+                      and the first n_pretrained_blocks transformer blocks.
+    Random group: PoM blocks, end att blocks, proj_out.
+
+    Works for both plain and FSDP-wrapped models.  For FSDP the groups are built
+    by module identity so each FSDP flat-param lands in exactly one group.
+    """
+    pretrained_name_frags = (
+        "pos_embed.", "time_text_embed.", "context_embedder.", "norm_out.",
+    ) + tuple(f"transformer_blocks.{i}." for i in range(n_pretrained_blocks))
+
+    if not isinstance(model, FSDP):
+        pretrained, random_p = [], []
+        for name, p in model.named_parameters():
+            is_pre = any(f in name for f in pretrained_name_frags)
+            (pretrained if is_pre else random_p).append(p)
+        return [
+            {"params": pretrained, "lr": lr * lr_scale},
+            {"params": random_p,   "lr": lr},
+        ]
+
+    # FSDP: each transformer block is its own FSDP unit after auto_wrap_policy.
+    # The outer FSDP (model itself) owns the overhead params as a flat param.
+    # Identify units by object identity to avoid name-matching fragility.
+    inner = model._fsdp_wrapped_module
+    pretrained_units = {model}  # outer FSDP = overhead = pretrained
+    for i in range(n_pretrained_blocks):
+        pretrained_units.add(inner.transformer_blocks[i])
+
+    pretrained_params, random_params = [], []
+    seen = set()
+    for mod in model.modules():
+        if not isinstance(mod, FSDP) or id(mod) in seen:
+            continue
+        seen.add(id(mod))
+        # named_parameters(recurse=False) returns the FlatParameter(s) owned
+        # directly by this FSDP unit, not those of nested FSDP sub-units.
+        own_params = [p for _, p in mod.named_parameters(recurse=False)]
+        if mod in pretrained_units:
+            pretrained_params.extend(own_params)
+        else:
+            random_params.extend(own_params)
+
+    if is_main():
+        n_pre  = sum(p.numel() for p in pretrained_params)
+        n_rand = sum(p.numel() for p in random_params)
+        print(f"Param groups: pretrained={n_pre/1e6:.1f}M @ lr×{lr_scale:.2f},  "
+              f"random={n_rand/1e6:.1f}M @ lr×1.00")
+
+    return [
+        {"params": pretrained_params, "lr": lr * lr_scale},
+        {"params": random_params,     "lr": lr},
+    ]
 
 
 def find_latest_checkpoint(out_dir: Path) -> Path | None:
@@ -663,6 +756,20 @@ def parse_args():
     p.add_argument("--attention_window_m", type=int, default=4,
                    help="Half-side of 2D local attention window; each image token attends "
                         "to a (2m+1)×(2m+1) neighbourhood. Ignored when hybrid_n=1.")
+    # Grouped architecture (Option B: 16-block, att-front + PoM-middle + att-end)
+    p.add_argument("--grouped", action="store_true",
+                   help="Build the 16-block grouped architecture (3 dual att + 11 PoM + 2 att) "
+                        "initialized from --model_id SD3.5 weights. Uses two-phase LR warmup "
+                        "to protect the pretrained front-att blocks from PoM noise gradients.")
+    p.add_argument("--n_front_att", type=int, default=3,
+                   help="Number of pretrained front attention blocks (grouped mode only)")
+    p.add_argument("--pretrained_lr_scale", type=float, default=0.05,
+                   help="LR multiplier for the pretrained param group (grouped mode). "
+                        "Front att blocks get lr * pretrained_lr_scale throughout training.")
+    p.add_argument("--lr_phase1_steps", type=int, default=500,
+                   help="End of phase 1 in two-phase LR warmup (grouped mode). "
+                        "During steps 0→phase1: random params warm up, pretrained frozen. "
+                        "During steps phase1→warmup_steps: pretrained warms up to lr*scale.")
 
     # Training
     p.add_argument("--batch_size", type=int, default=4)
@@ -825,6 +932,20 @@ def main():
             device=device, dtype=torch.bfloat16
         )
         num_layers = model.config.num_layers
+    elif not args.smoke_test and args.grouped:
+        print(f"[rank {rank}] Building grouped 16-block architecture from {args.model_id} ...")
+        model = build_grouped_from_sd3_pretrained(
+            model_id=args.model_id,
+            n_front_att=args.n_front_att,
+            pom_degree=args.pom_degree,
+            pom_expand=args.pom_expand,
+            pom_n_groups=args.pom_n_groups,
+            pom_n_sel_heads=args.pom_n_sel_heads,
+            pom_rope_max_seq_len=args.pom_rope_max_seq_len,
+            torch_dtype=torch.bfloat16,
+            device=device,
+        )
+        num_layers = model.config.num_layers
     elif not args.smoke_test:
         print(f"[rank {rank}] Initializing PoM model from scratch (all 24 blocks random) ...")
         model = PomSD3Transformer2DModel(
@@ -876,10 +997,19 @@ def main():
     model.train()
 
     # --- Optimizer (created on sharded params when FSDP is active) ---
-    all_params = list(model.parameters())
-    optimizer = torch.optim.AdamW(
-        all_params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.999),
-    )
+    if args.grouped:
+        _param_groups = _make_grouped_param_groups(
+            model, n_pretrained_blocks=args.n_front_att,
+            lr=args.lr, lr_scale=args.pretrained_lr_scale,
+        )
+        optimizer = torch.optim.AdamW(
+            _param_groups, weight_decay=args.weight_decay, betas=(0.9, 0.999),
+        )
+    else:
+        all_params = list(model.parameters())
+        optimizer = torch.optim.AdamW(
+            all_params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.999),
+        )
 
     # --- Restore from checkpoint ---
     step = 0
@@ -946,9 +1076,18 @@ def main():
             batch_iter = iter(loader)
             batch = next(batch_iter)
 
-        lr = lr_schedule(step, args.warmup_steps, args.max_steps, args.lr)
-        for pg in optimizer.param_groups:
-            pg["lr"] = lr
+        if args.grouped:
+            pre_lr, rand_lr = two_phase_lr(
+                step, args.lr_phase1_steps, args.warmup_steps, args.max_steps,
+                args.lr, args.pretrained_lr_scale,
+            )
+            optimizer.param_groups[0]["lr"] = pre_lr
+            optimizer.param_groups[1]["lr"] = rand_lr
+            lr = rand_lr
+        else:
+            lr = lr_schedule(step, args.warmup_steps, args.max_steps, args.lr)
+            for pg in optimizer.param_groups:
+                pg["lr"] = lr
 
         pixel_values = batch["pixel_values"]
         captions = batch["caption"]
@@ -1032,7 +1171,7 @@ def main():
             if isinstance(model, FSDP):
                 model.clip_grad_norm_(1.0)
             else:
-                torch.nn.utils.clip_grad_norm_(all_params, 1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
@@ -1054,6 +1193,9 @@ def main():
                 "step": step,
                 "samples_per_sec": sps,
             }
+            if args.grouped:
+                log["lr_pretrained"] = pre_lr
+                log["lr_random"] = rand_lr
             wandb.log(log, step=step)
             print(f"step={step:7d}  loss={log['loss']:.4f}  lr={lr:.2e}  {sps:.1f} samp/s")
 

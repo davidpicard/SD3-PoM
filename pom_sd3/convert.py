@@ -25,6 +25,29 @@ SD35_MEDIUM_CONFIG = dict(
     qk_norm="rms_norm",
 )
 
+# 16-block grouped architecture: 3 dual att (front) + 11 PoM (middle) + 2 att (end, random)
+# Layers 0-2: dual JointTransformerBlock  (initialized from SD3.5)
+# Layers 3-8: dual JointPoMBlock          (random init)
+# Layers 9-13: single JointPoMBlock       (random init)
+# Layer 14: single JointTransformerBlock  (random init)
+# Layer 15: single JointTransformerBlock, context_pre_only  (random init)
+GROUPED_16_CONFIG = dict(
+    sample_size=128,
+    patch_size=2,
+    in_channels=16,
+    num_layers=16,
+    attention_head_dim=64,
+    num_attention_heads=24,
+    joint_attention_dim=4096,
+    caption_projection_dim=1536,
+    pooled_projection_dim=2048,
+    out_channels=16,
+    pos_embed_max_size=384,
+    dual_attention_layers=(0, 1, 2, 3, 4, 5, 6, 7, 8),
+    pom_layers=(3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13),
+    qk_norm="rms_norm",
+)
+
 _ATTENTION_KEY_RE = re.compile(r"transformer_blocks\.(\d+)\.attn2?\.")
 _BLOCK_IDX_RE = re.compile(r"transformer_blocks\.(\d+)\.")
 
@@ -178,6 +201,98 @@ def build_from_sd3_pretrained(
     missing, _ = load_sd3_weights_into_pom(student, teacher_sd)
     pom_keys = [k for k in missing if any(f in k for f in (".pom.", ".pom2."))]
     print(f"  PoM-specific params randomly initialized: {len(pom_keys)} keys")
+
+    return student.to(device)
+
+
+def build_grouped_from_sd3_pretrained(
+    model_id: str = "stabilityai/stable-diffusion-3.5-medium",
+    n_front_att: int = 3,
+    pom_degree: int = 4,
+    pom_expand: int = 2,
+    pom_n_groups: int = 1,
+    pom_n_sel_heads: int = 24,
+    pom_rope_max_seq_len: int = 8192,
+    torch_dtype: torch.dtype = torch.bfloat16,
+    device: str | torch.device = "cpu",
+) -> PomSD3Transformer2DModel:
+    """Build a 16-block grouped architecture partially initialized from SD3.5 medium.
+
+    What is copied from SD3.5:
+      - pos_embed, time_text_embed, context_embedder, norm_out  (overhead)
+      - transformer_blocks 0 .. n_front_att-1  (front attention blocks)
+
+    What is randomly initialized:
+      - All PoM blocks (layers 3-13)
+      - End attention blocks (layers 14-15)
+      - proj_out
+
+    The front att blocks receive valid SD3.5 weights and see an identical input
+    distribution from the pretrained overhead, so their initialization is meaningful
+    from step 0.  The end att blocks see PoM output which is foreign to any pretrained
+    weights, so random init is preferable.
+    """
+    from pathlib import Path
+    local_files_only = Path(model_id).exists()
+
+    print(f"Loading SD3.5 teacher from {model_id} ...")
+    teacher = SD3Transformer2DModel.from_pretrained(
+        model_id,
+        subfolder="transformer",
+        torch_dtype=torch_dtype,
+        local_files_only=local_files_only,
+    )
+    teacher_sd = teacher.state_dict()
+    del teacher
+
+    pom_kwargs = dict(
+        pom_degree=pom_degree,
+        pom_expand=pom_expand,
+        pom_n_groups=pom_n_groups,
+        pom_n_sel_heads=pom_n_sel_heads,
+        pom_rope_max_seq_len=pom_rope_max_seq_len,
+        lora_rank=0,
+    )
+    student = PomSD3Transformer2DModel(**GROUPED_16_CONFIG, **pom_kwargs).to(dtype=torch_dtype)
+    student_sd = student.state_dict()
+
+    # Keys to transfer: pretrained overhead + front att blocks only
+    pretrained_prefixes = (
+        "pos_embed.", "time_text_embed.", "context_embedder.", "norm_out.",
+    ) + tuple(f"transformer_blocks.{i}." for i in range(n_front_att))
+
+    transfer, shape_errors = {}, []
+    for key, val in teacher_sd.items():
+        if not any(key.startswith(p) for p in pretrained_prefixes):
+            continue
+        if key not in student_sd:
+            continue
+        if student_sd[key].shape != val.shape:
+            shape_errors.append((key, student_sd[key].shape, val.shape))
+            continue
+        transfer[key] = val
+
+    if shape_errors:
+        raise RuntimeError(
+            "Shape mismatches during grouped weight transfer:\n"
+            + "\n".join(f"  {k}: student={s} teacher={t}" for k, s, t in shape_errors)
+        )
+
+    missing, _ = student.load_state_dict(transfer, strict=False)
+
+    # Any non-transferred student key is expected to be missing (random init).
+    # Warn only if a key that should have been transferred is absent.
+    expected_random = {k for k in student_sd if not any(k.startswith(p) for p in pretrained_prefixes)}
+    surprise = [k for k in missing if k not in expected_random]
+    if surprise:
+        print(f"WARNING: {len(surprise)} pretrained keys missing after transfer: {surprise[:5]}")
+
+    n_pre_params = sum(v.numel() for v in transfer.values())
+    n_rand_params = sum(student_sd[k].numel() for k in expected_random)
+    print(f"  Transferred {len(transfer)} tensors ({n_pre_params/1e6:.1f}M params): "
+          f"overhead + {n_front_att} front att blocks")
+    print(f"  Randomly initialized {len(expected_random)} tensors ({n_rand_params/1e6:.1f}M params): "
+          f"PoM blocks + end att blocks + proj_out")
 
     return student.to(device)
 
