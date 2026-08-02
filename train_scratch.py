@@ -361,48 +361,45 @@ def _make_grouped_param_groups(
 ) -> list[dict]:
     """Two optimizer param groups: pretrained (low lr) and random (full lr).
 
-    Pretrained group: pos_embed, time_text_embed, context_embedder, norm_out,
-                      and the first n_pretrained_blocks transformer blocks.
-    Random group: PoM blocks, end att blocks, proj_out.
+    Pretrained group: overhead (pos_embed, time_text_embed, context_embedder,
+                      norm_out, proj_out) + the first n_pretrained_blocks blocks.
+    Random group: PoM blocks + end att blocks.
 
-    Works for both plain and FSDP-wrapped models.  For FSDP the groups are built
-    by module identity so each FSDP flat-param lands in exactly one group.
+    Works for both plain and FSDP-wrapped models.
+
+    For FSDP: model.named_parameters(recurse=False) / named_parameters on
+    individual sub-units does NOT work reliably in mixed-precision FSDP because
+    the working (bf16) flat params only exist inside fwd/bwd and have numel=0
+    outside that context.  Instead we use model.parameters() (the full-recursion
+    path) and identify per-block params by calling .parameters() on each block's
+    FSDP wrapper directly — which is known to work because the same mechanism
+    powers the non-grouped optimizer path.
     """
-    pretrained_name_frags = (
-        "pos_embed.", "time_text_embed.", "context_embedder.", "norm_out.",
-    ) + tuple(f"transformer_blocks.{i}." for i in range(n_pretrained_blocks))
+    inner = getattr(model, '_fsdp_wrapped_module', model)
+    num_layers = inner.config.num_layers
 
-    if not isinstance(model, FSDP):
-        pretrained, random_p = [], []
-        for name, p in model.named_parameters():
-            is_pre = any(f in name for f in pretrained_name_frags)
-            (pretrained if is_pre else random_p).append(p)
-        return [
-            {"params": pretrained, "lr": lr * lr_scale},
-            {"params": random_p,   "lr": lr},
-        ]
+    # Collect flat params for every transformer block, keyed by block index.
+    # For FSDP models each transformer_blocks[i] is an inner FSDP unit whose
+    # .parameters() returns its fp32 master flat param(s) reliably.
+    block_param_ids: set[int] = set()
+    block_params_by_idx: dict[int, list] = {}
+    for i in range(num_layers):
+        ps = list(inner.transformer_blocks[i].parameters())
+        block_params_by_idx[i] = ps
+        block_param_ids.update(id(p) for p in ps)
 
-    # FSDP: each transformer block is its own FSDP unit after auto_wrap_policy.
-    # The outer FSDP (model itself) owns the overhead params as a flat param.
-    # Identify units by object identity to avoid name-matching fragility.
-    inner = model._fsdp_wrapped_module
-    pretrained_units = {model}  # outer FSDP = overhead = pretrained
-    for i in range(n_pretrained_blocks):
-        pretrained_units.add(inner.transformer_blocks[i])
+    # Overhead = everything that is NOT inside a transformer block.
+    # (pos_embed, time_text_embed, context_embedder, norm_out, proj_out)
+    overhead = [p for p in model.parameters() if id(p) not in block_param_ids]
 
-    pretrained_params, random_params = [], []
-    seen = set()
-    for mod in model.modules():
-        if not isinstance(mod, FSDP) or id(mod) in seen:
-            continue
-        seen.add(id(mod))
-        # named_parameters(recurse=False) returns the FlatParameter(s) owned
-        # directly by this FSDP unit, not those of nested FSDP sub-units.
-        own_params = [p for _, p in mod.named_parameters(recurse=False)]
-        if mod in pretrained_units:
-            pretrained_params.extend(own_params)
+    pretrained_params = overhead[:]
+    random_params: list = []
+    for i in range(num_layers):
+        ps = block_params_by_idx[i]
+        if i < n_pretrained_blocks:
+            pretrained_params.extend(ps)
         else:
-            random_params.extend(own_params)
+            random_params.extend(ps)
 
     if is_main():
         n_pre  = sum(p.numel() for p in pretrained_params)
