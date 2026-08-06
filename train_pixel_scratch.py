@@ -346,11 +346,38 @@ SAMPLE_PROMPTS = [
 
 @contextlib.contextmanager
 def _silence_encoding_noise():
-    """Suppress the T5 'You have an extremely long sequence' UserWarning."""
-    import warnings
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message=".*extremely long.*")
+    """Suppress tokenizer noise during encode_prompt.
+
+    Covers two channels:
+    - fd 2 / sys.stderr: the Rust fast-tokenizer and diffusers CLIP-truncation
+      warning both write directly to fd 2, bypassing Python's logging system.
+      (<|endoftext|> padding tokens printed when caption exceeds 77 CLIP tokens.)
+    - transformers.tokenization_utils_base logger: emits the
+      "Token indices sequence length is longer than …" warning via Python
+      logging, which wandb captures through its root-logger handler.
+      Raising the level to ERROR for the duration prevents it from
+      appearing in wandb logs.
+    """
+    import logging as _logging
+    tok_logger = _logging.getLogger("transformers.tokenization_utils_base")
+    old_level = tok_logger.level
+    tok_logger.setLevel(_logging.ERROR)
+
+    old_fd = os.dup(2)
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull_fd, 2)
+    os.close(devnull_fd)
+    old_stderr = sys.stderr
+    sys.stderr = open(os.devnull, "w")
+    try:
         yield
+    finally:
+        sys.stderr.flush()
+        sys.stderr.close()
+        sys.stderr = old_stderr
+        os.dup2(old_fd, 2)
+        os.close(old_fd)
+        tok_logger.setLevel(old_level)
 
 
 # ---------------------------------------------------------------------------
