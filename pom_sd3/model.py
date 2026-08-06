@@ -4,6 +4,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.loaders import FromOriginalModelMixin, PeftAdapterMixin, SD3Transformer2DLoadersMixin
@@ -17,6 +18,78 @@ from diffusers.utils import logging
 from .blocks import JointLocalAttnBlock, JointPoMBlock
 
 logger = logging.get_logger(__name__)
+
+
+class PixelPatchEmbed(nn.Module):
+    """Pixel-space patch embedding for JiT-style flow matching (no VAE).
+
+    Replaces Conv2d(in_channels→embed_dim) with a two-stage linear bottleneck
+    (patch_dim → bottleneck_dim → embed_dim) that avoids projecting 3072-dim
+    patch vectors directly into the 1536-dim transformer space.
+
+    Position embedding: 2D sin-cos at a fixed max grid size, bilinear-interpolated
+    for other grid sizes at runtime.
+    """
+
+    def __init__(
+        self,
+        patch_size: int = 32,
+        in_channels: int = 3,
+        bottleneck_dim: int = 256,
+        embed_dim: int = 1536,
+        pos_embed_max_size: int = 64,
+    ):
+        super().__init__()
+        self.patch_size = patch_size
+        # Stage 1: Conv2d is mathematically identical to a linear map on non-overlapping patches
+        # (same kernel size and stride) but operates on (B, C, H, W) input directly.
+        self.patch_proj = nn.Conv2d(
+            in_channels, bottleneck_dim, kernel_size=patch_size, stride=patch_size
+        )
+        # Stage 2: expand bottleneck to transformer dim
+        self.expand_proj = nn.Linear(bottleneck_dim, embed_dim)
+        # Pre-compute sinusoidal pos_embed at max grid size; interpolate for other sizes
+        pos = self._build_sincos2d(embed_dim, pos_embed_max_size, pos_embed_max_size)
+        self.register_buffer("pos_embed", pos.unsqueeze(0))  # (1, max_size², embed_dim)
+        self.pos_embed_max_size = pos_embed_max_size
+
+    @staticmethod
+    def _build_sincos2d(embed_dim: int, grid_h: int, grid_w: int) -> torch.Tensor:
+        assert embed_dim % 4 == 0, "embed_dim must be divisible by 4"
+        d = embed_dim // 4
+        inv_freq = 1.0 / (10000 ** (torch.arange(d, dtype=torch.float32) / d))
+        gy = torch.arange(grid_h, dtype=torch.float32)
+        gx = torch.arange(grid_w, dtype=torch.float32)
+        ey = torch.outer(gy, inv_freq)  # (h, d)
+        ex = torch.outer(gx, inv_freq)  # (w, d)
+        emb = torch.cat([
+            ey.sin().unsqueeze(1).expand(grid_h, grid_w, d),
+            ey.cos().unsqueeze(1).expand(grid_h, grid_w, d),
+            ex.sin().unsqueeze(0).expand(grid_h, grid_w, d),
+            ex.cos().unsqueeze(0).expand(grid_h, grid_w, d),
+        ], dim=-1)  # (h, w, 4d)
+        return emb.reshape(grid_h * grid_w, embed_dim)
+
+    def _get_pos_embed(self, h: int, w: int, device, dtype) -> torch.Tensor:
+        s = self.pos_embed_max_size
+        if h == s and w == s:
+            return self.pos_embed.to(device=device, dtype=dtype)
+        pos = self.pos_embed.reshape(1, s, s, -1).permute(0, 3, 1, 2)  # (1, D, s, s)
+        pos = F.interpolate(pos.float(), size=(h, w), mode="bilinear", align_corners=False)
+        pos = pos.permute(0, 2, 3, 1).reshape(1, h * w, -1)
+        return pos.to(device=device, dtype=dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, H, W) pixel image in [-1, 1]
+        _, _, H, W = x.shape
+        p = self.patch_size
+        h, w = H // p, W // p
+        # Stage 1: patchify + bottleneck → (B, bottleneck_dim, h, w)
+        x = self.patch_proj(x.to(self.patch_proj.weight.dtype))
+        x = x.flatten(2).transpose(1, 2)   # (B, h*w, bottleneck_dim)
+        # Stage 2: expand to transformer dim
+        x = self.expand_proj(x)             # (B, h*w, embed_dim)
+        return x + self._get_pos_embed(h, w, x.device, x.dtype)
 
 
 class PomSD3Transformer2DModel(
@@ -74,19 +147,31 @@ class PomSD3Transformer2DModel(
         # pom_layers lists the block indices that should be JointPoMBlock;
         # all other indices become JointTransformerBlock.
         pom_layers: tuple[int, ...] = (),
+        # Pixel-space mode: when set, replaces PatchEmbed with PixelPatchEmbed
+        # (two-stage linear bottleneck; no VAE required).
+        pixel_patch_bottleneck_dim: int | None = None,
     ):
         super().__init__()
         self.out_channels = out_channels if out_channels is not None else in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
 
-        self.pos_embed = PatchEmbed(
-            height=sample_size,
-            width=sample_size,
-            patch_size=patch_size,
-            in_channels=in_channels,
-            embed_dim=self.inner_dim,
-            pos_embed_max_size=pos_embed_max_size,
-        )
+        if pixel_patch_bottleneck_dim is not None:
+            self.pos_embed = PixelPatchEmbed(
+                patch_size=patch_size,
+                in_channels=in_channels,
+                bottleneck_dim=pixel_patch_bottleneck_dim,
+                embed_dim=self.inner_dim,
+                pos_embed_max_size=pos_embed_max_size,
+            )
+        else:
+            self.pos_embed = PatchEmbed(
+                height=sample_size,
+                width=sample_size,
+                patch_size=patch_size,
+                in_channels=in_channels,
+                embed_dim=self.inner_dim,
+                pos_embed_max_size=pos_embed_max_size,
+            )
         self.time_text_embed = CombinedTimestepTextProjEmbeddings(
             embedding_dim=self.inner_dim, pooled_projection_dim=pooled_projection_dim
         )

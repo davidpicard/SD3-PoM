@@ -48,6 +48,28 @@ GROUPED_16_CONFIG = dict(
     qk_norm="rms_norm",
 )
 
+# 16-block pixel-space architecture: same block layout as GROUPED_16_CONFIG but
+# trained entirely from scratch on raw pixels (no VAE, patch_size=32, in_channels=3).
+# All 16 blocks are randomly initialized; AdaLN-Zero is applied to all of them.
+# pos_embed_max_size=64 → covers up to 64×64 grid (2048px with p=32).
+PIXEL_GROUPED_16_CONFIG = dict(
+    sample_size=512,
+    patch_size=32,
+    in_channels=3,
+    num_layers=16,
+    attention_head_dim=64,
+    num_attention_heads=24,
+    joint_attention_dim=4096,
+    caption_projection_dim=1536,
+    pooled_projection_dim=2048,
+    out_channels=3,
+    pos_embed_max_size=64,
+    dual_attention_layers=(0, 1, 2, 3, 4, 5, 6, 7, 8),
+    pom_layers=(3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13),
+    qk_norm="rms_norm",
+    pixel_patch_bottleneck_dim=256,
+)
+
 _ATTENTION_KEY_RE = re.compile(r"transformer_blocks\.(\d+)\.attn2?\.")
 _BLOCK_IDX_RE = re.compile(r"transformer_blocks\.(\d+)\.")
 
@@ -315,6 +337,59 @@ def build_grouped_from_sd3_pretrained(
           f"PoM blocks + end att blocks + proj_out")
 
     return student.to(device)
+
+
+def build_pixel_grouped(
+    patch_size: int = 32,
+    bottleneck_dim: int = 256,
+    pom_degree: int = 4,
+    pom_expand: int = 2,
+    pom_n_groups: int = 1,
+    pom_n_sel_heads: int = 24,
+    pom_rope_max_seq_len: int = 8192,
+    torch_dtype: torch.dtype = torch.bfloat16,
+    device: str | torch.device = "cpu",
+) -> PomSD3Transformer2DModel:
+    """Build a pixel-space 16-block grouped architecture, fully randomly initialized.
+
+    All 16 blocks get AdaLN-Zero init so each block starts as an identity map
+    (gate=0 suppresses output, scale/shift=0 zeroes the norm input). Training
+    then gradually activates each block, starting from a clean residual stream.
+    """
+    import torch.nn as nn
+
+    config = dict(PIXEL_GROUPED_16_CONFIG)
+    config["patch_size"] = patch_size
+    config["pixel_patch_bottleneck_dim"] = bottleneck_dim
+    # pos_embed_max_size: 4096 / patch_size patches covers resolutions up to 4096px
+    config["pos_embed_max_size"] = max(64, 4096 // patch_size)
+
+    pom_kwargs = dict(
+        pom_degree=pom_degree,
+        pom_expand=pom_expand,
+        pom_n_groups=pom_n_groups,
+        pom_n_sel_heads=pom_n_sel_heads,
+        pom_rope_max_seq_len=pom_rope_max_seq_len,
+        lora_rank=0,
+    )
+    model = PomSD3Transformer2DModel(**config, **pom_kwargs).to(dtype=torch_dtype)
+
+    # AdaLN-Zero: zero-init all AdaLayerNorm gating projections so every block
+    # is an identity map at step 0. Unlike the grouped latent model (which has
+    # 3 pretrained front blocks), ALL pixel blocks are random — so apply to all 16.
+    for blk in model.transformer_blocks:
+        for attr in ("norm1", "norm1_context"):
+            norm = getattr(blk, attr, None)
+            if norm is not None and hasattr(norm, "linear"):
+                nn.init.zeros_(norm.linear.weight)
+                if norm.linear.bias is not None:
+                    nn.init.zeros_(norm.linear.bias)
+
+    n_total = sum(p.numel() for p in model.parameters())
+    print(f"Built pixel-space g16 model: {n_total/1e6:.1f}M params, "
+          f"patch_size={patch_size}, bottleneck_dim={bottleneck_dim}")
+
+    return model.to(device)
 
 
 def replace_next_attention_block(model: PomSD3Transformer2DModel) -> JointPoMBlock:
