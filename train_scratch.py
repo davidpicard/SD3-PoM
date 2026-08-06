@@ -305,6 +305,7 @@ def wrap_model_fsdp(model: torch.nn.Module, local_rank: int,
             auto_wrap_policy=wrap_policy,
             mixed_precision=mp,
             device_id=local_rank,
+            forward_prefetch=True,
         )
 
     return FSDP(
@@ -313,6 +314,7 @@ def wrap_model_fsdp(model: torch.nn.Module, local_rank: int,
         auto_wrap_policy=wrap_policy,
         mixed_precision=mp,
         device_id=local_rank,
+        forward_prefetch=True,
     )
 
 
