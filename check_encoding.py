@@ -124,7 +124,7 @@ def main():
 
         # --- reference: sequential encode_prompt ---
         with torch.no_grad():
-            ref_enc_hs, ref_pooled, _, _ = pipe.encode_prompt(
+            ref_enc_hs, _, ref_pooled, _ = pipe.encode_prompt(
                 prompt=caption,
                 prompt_2=caption,
                 prompt_3=caption,
