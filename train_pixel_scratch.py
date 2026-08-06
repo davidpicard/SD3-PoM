@@ -604,7 +604,7 @@ def parse_args():
     p.add_argument("--log_every", type=int, default=500)
     p.add_argument("--save_every", type=int, default=40_000)
     p.add_argument("--sample_every", type=int, default=20_000)
-    p.add_argument("--num_sample_prompts", type=int, default=4)
+    p.add_argument("--num_sample_prompts", type=int, default=25)
     p.add_argument("--num_sample_steps", type=int, default=50)
     p.add_argument("--guidance_scale", type=float, default=4.0)
     p.add_argument("--wandb_project", default="pixel-pom-g16")
@@ -932,7 +932,7 @@ def main():
                 patch_size=args.patch_size,
                 null_enc_hs=null_enc_hs,
                 null_pooled=null_pooled,
-                num_prompts=args.num_sample_prompts,
+                num_prompts=25,
                 num_steps=args.num_sample_steps,
                 guidance_scale=args.guidance_scale,
             )
