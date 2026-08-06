@@ -132,20 +132,17 @@ def fast_encode_prompt(text_pipe, captions, max_sequence_length, device):
         truncation=True, return_tensors="pt",
     ).input_ids.to(device)
 
-    t5_enc = text_pipe.tokenizer_3(
+    t5_ids = text_pipe.tokenizer_3(
         captions, padding="max_length", max_length=max_sequence_length,
         truncation=True, return_tensors="pt",
-    )
-    t5_ids  = t5_enc.input_ids.to(device)
-    t5_mask = t5_enc.attention_mask.to(device)
+    ).input_ids.to(device)
 
     stream_t5   = torch.cuda.Stream(device=device)
     stream_clip = torch.cuda.Stream(device=device)
 
     with torch.cuda.stream(stream_t5):
-        t5_tok = text_pipe.text_encoder_3(
-            input_ids=t5_ids, attention_mask=t5_mask,
-        ).last_hidden_state
+        # No attention_mask: matches encode_prompt, T5 attends to all positions.
+        t5_tok = text_pipe.text_encoder_3(input_ids=t5_ids).last_hidden_state
 
     with torch.cuda.stream(stream_clip):
         out1       = text_pipe.text_encoder(input_ids=clip_ids_1, output_hidden_states=True)
