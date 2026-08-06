@@ -64,7 +64,7 @@ srun torchrun \
         --pom_expand 2 \
         --pom_n_groups 1 \
         --pom_n_sel_heads 24 \
-        --batch_size 16 \
+        --batch_size 32 \
         --grad_accum_steps 4 \
         --lr 1e-3 \
         --warmup_steps 2000 \
