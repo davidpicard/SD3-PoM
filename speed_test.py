@@ -116,6 +116,58 @@ def wrap_fsdp(model, local_rank, args):
 
 
 # ---------------------------------------------------------------------------
+# Parallel text encoding (same logic as in training scripts)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def fast_encode_prompt(text_pipe, captions, max_sequence_length, device):
+    """Pre-tokenise all three, then overlap T5 and CLIPs on separate CUDA streams."""
+    clip_ids_1 = text_pipe.tokenizer(
+        captions, padding="max_length", max_length=77,
+        truncation=True, return_tensors="pt",
+    ).input_ids.to(device)
+
+    clip_ids_2 = text_pipe.tokenizer_2(
+        captions, padding="max_length", max_length=77,
+        truncation=True, return_tensors="pt",
+    ).input_ids.to(device)
+
+    t5_enc = text_pipe.tokenizer_3(
+        captions, padding="max_length", max_length=max_sequence_length,
+        truncation=True, return_tensors="pt",
+    )
+    t5_ids  = t5_enc.input_ids.to(device)
+    t5_mask = t5_enc.attention_mask.to(device)
+
+    stream_t5   = torch.cuda.Stream(device=device)
+    stream_clip = torch.cuda.Stream(device=device)
+
+    with torch.cuda.stream(stream_t5):
+        t5_tok = text_pipe.text_encoder_3(
+            input_ids=t5_ids, attention_mask=t5_mask,
+        ).last_hidden_state
+
+    with torch.cuda.stream(stream_clip):
+        out1       = text_pipe.text_encoder(input_ids=clip_ids_1, output_hidden_states=True)
+        clip1_tok  = out1.hidden_states[-2]
+        clip1_pool = out1.text_embeds
+
+        out2       = text_pipe.text_encoder_2(input_ids=clip_ids_2, output_hidden_states=True)
+        clip2_tok  = out2.hidden_states[-2]
+        clip2_pool = out2.text_embeds
+
+    curr = torch.cuda.current_stream(device=device)
+    curr.wait_stream(stream_t5)
+    curr.wait_stream(stream_clip)
+
+    clip_tok = torch.cat([clip1_tok, clip2_tok], dim=-1)
+    clip_tok = F.pad(clip_tok, (0, t5_tok.shape[-1] - clip_tok.shape[-1]))
+    enc_hs   = torch.cat([clip_tok, t5_tok], dim=1)
+    pooled   = torch.cat([clip1_pool, clip2_pool], dim=-1)
+    return enc_hs.to(dtype=torch.bfloat16), pooled.to(dtype=torch.bfloat16)
+
+
+# ---------------------------------------------------------------------------
 # Timing helpers
 # ---------------------------------------------------------------------------
 
@@ -262,12 +314,13 @@ def main():
     # ------------------------------------------------------------------ Timers
     timers = {
         "clip_l":       StepTimer(),
-        "clip_g":       StepTimer(),
-        "t5":           StepTimer(),
-        "encode_total": StepTimer(),
-        "fwd":          StepTimer(),
-        "bwd":          StepTimer(),
-        "opt_step":     StepTimer(),
+        "clip_g":          StepTimer(),
+        "t5":              StepTimer(),
+        "encode_total":    StepTimer(),
+        "encode_parallel": StepTimer(),
+        "fwd":             StepTimer(),
+        "bwd":             StepTimer(),
+        "opt_step":        StepTimer(),
     }
 
     # ------------------------------------------------------------------ Benchmark loop
@@ -321,6 +374,13 @@ def main():
             )
         enc_hs = enc_hs.to(dtype=torch.bfloat16)
         pooled = pooled.to(dtype=torch.bfloat16)
+        if timing: t.stop()
+
+        # Parallel encoding: pre-tokenise + overlapped CUDA streams
+        t = timers["encode_parallel"]
+        if timing: t.start()
+        enc_hs, pooled = fast_encode_prompt(text_pipe, dummy_captions,
+                                            args.max_sequence_length, device)
         if timing: t.stop()
 
         # JiT flow matching: t=0 noise, t=1 clean
@@ -379,20 +439,26 @@ def main():
         barrier()
         return
 
-    rows = [
-        ("CLIP-L",                timers["clip_l"]),
-        ("CLIP-G",                timers["clip_g"]),
-        (f"T5 (seq={args.max_sequence_length})", timers["t5"]),
-        ("encode_prompt total",   timers["encode_total"]),
-        ("Transformer fwd",       timers["fwd"]),
-        ("Transformer bwd",       timers["bwd"]),
-        ("Optimizer step",        timers["opt_step"]),
-    ]
+    enc_total_ms   = timers["encode_total"].mean_ms
+    enc_parallel_ms = timers["encode_parallel"].mean_ms
+    fwd_ms  = timers["fwd"].mean_ms
+    bwd_ms  = timers["bwd"].mean_ms
+    opt_ms  = timers["opt_step"].mean_ms
 
-    step_ms = (timers["encode_total"].mean_ms
-               + timers["fwd"].mean_ms
-               + timers["bwd"].mean_ms
-               + timers["opt_step"].mean_ms)
+    # Step total uses fast_encode_prompt (the path the training scripts use)
+    step_ms      = enc_parallel_ms + fwd_ms + bwd_ms + opt_ms
+    step_ms_slow = enc_total_ms    + fwd_ms + bwd_ms + opt_ms
+
+    rows = [
+        ("  CLIP-L (raw)",              timers["clip_l"]),
+        ("  CLIP-G (raw)",              timers["clip_g"]),
+        (f"  T5 (seq={args.max_sequence_length}) (raw)", timers["t5"]),
+        ("encode_prompt (sequential)",  timers["encode_total"]),
+        ("fast_encode_prompt (parallel)", timers["encode_parallel"]),
+        ("Transformer fwd",             timers["fwd"]),
+        ("Transformer bwd",             timers["bwd"]),
+        ("Optimizer step",              timers["opt_step"]),
+    ]
 
     print()
     print("=" * 76)
@@ -400,31 +466,29 @@ def main():
     print(f"  bs={B}×{ws()} GPUs · {H}px · patch={args.patch_size} · "
           f"T5_seq={args.max_sequence_length}")
     print("=" * 76)
-    print(f"  {'Component':<32} {'Mean (ms)':>10} {'±Std':>8} {'% of step':>10}")
+    print(f"  {'Component':<36} {'Mean (ms)':>10} {'±Std':>8}")
     print("-" * 76)
     for label, tmr in rows:
-        pct = 100.0 * tmr.mean_ms / step_ms if step_ms > 0 else 0.0
-        print(f"  {label:<32} {tmr.mean_ms:>10.1f} {tmr.std_ms:>8.1f} {pct:>9.1f}%")
+        print(f"  {label:<36} {tmr.mean_ms:>10.1f} {tmr.std_ms:>8.1f}")
     print("-" * 76)
-    print(f"  {'Step total (estimated)':<32} {step_ms:>10.1f}")
-    sps = B * ws() / (step_ms / 1000.0)
-    print(f"  {'Throughput':<32} {sps:>10.0f} samp/s")
+    sps_slow = B * ws() / (step_ms_slow / 1000.0)
+    sps_fast = B * ws() / (step_ms      / 1000.0)
+    print(f"  {'Step (encode_prompt)':<36} {step_ms_slow:>10.1f}   → {sps_slow:>5.0f} samp/s")
+    print(f"  {'Step (fast_encode_prompt)':<36} {step_ms:>10.1f}   → {sps_fast:>5.0f} samp/s")
+    enc_saving = enc_total_ms - enc_parallel_ms
+    print(f"  Encoding saved: {enc_saving:.1f} ms  "
+          f"({100*enc_saving/step_ms_slow:.0f}% of step)  "
+          f"overhead ratio: {enc_total_ms/enc_parallel_ms:.2f}×")
     print("=" * 76)
 
-    biggest = max(rows, key=lambda r: r[1].mean_ms)
-    pct_biggest = 100.0 * biggest[1].mean_ms / step_ms
-    print(f"\n  Bottleneck: {biggest[0]} ({pct_biggest:.0f}% of step)")
-
-    enc_ms  = timers["encode_total"].mean_ms
-    fwdbwd  = timers["fwd"].mean_ms + timers["bwd"].mean_ms
-    t5_ms   = timers["t5"].mean_ms
-    if enc_ms > fwdbwd:
-        print("  → Text encoding dominates. Caching embeddings would give the biggest gain.")
-        if t5_ms > 0.5 * enc_ms:
-            print(f"  → T5 is {100*t5_ms/enc_ms:.0f}% of encoding cost — "
-                  f"rank-0-only encoding or pre-computation is the key lever.")
+    t5_ms = timers["t5"].mean_ms
+    if enc_parallel_ms > fwd_ms + bwd_ms:
+        print(f"\n  Bottleneck: fast_encode_prompt ({enc_parallel_ms:.0f} ms > "
+              f"fwd+bwd {fwd_ms+bwd_ms:.0f} ms)")
+        print(f"  → Pre-computing embeddings offline would save the remaining {enc_parallel_ms:.0f} ms.")
+        print(f"  → T5 alone is {t5_ms:.0f} ms — irreducible floor without pre-computation.")
     else:
-        print("  → Transformer fwd+bwd dominates. "
+        print(f"\n  Bottleneck: Transformer fwd+bwd ({fwd_ms+bwd_ms:.0f} ms). "
               "FSDP overlap and torch.compile are the main levers.")
 
     barrier()
