@@ -1,12 +1,23 @@
 #!/usr/bin/env python3
 """
-Per-component speed benchmark for the SD3-PoM training loop.
+Per-component speed benchmark for the pixel-space SD3-PoM training loop.
 
-Single GPU:    python speed_test.py --model_id /path/to/sd3.5-medium
-4-GPU node:    torchrun --nproc_per_node=4 speed_test.py --model_id /path/to/sd3.5-medium
+Single GPU:
+    python speed_test.py --model_id /path/to/sd3.5-medium
 
-Warms up for --n_warmup steps (lets torch.compile finish), then times --n_steps steps
-and prints a breakdown table showing where time actually goes.
+4-GPU node:
+    torchrun --nproc_per_node=4 speed_test.py --model_id /path/to/sd3.5-medium
+
+Measures text encoding, transformer fwd, transformer bwd, and optimizer step.
+No VAE — the pixel model operates directly in pixel space.
+
+Flags to A/B test (all off by default so each adds cleanly over the baseline):
+  --forward_prefetch       FSDP forward all-gather prefetch (overlaps comm + compute)
+  --no_limit_all_gathers   remove FSDP cap on concurrent in-flight all-gathers
+  --use_orig_params        FSDP use_orig_params=True (required for --compile_model)
+  --compile_model          torch.compile the transformer (needs --use_orig_params)
+  --cudnn_benchmark        cuDNN autotuning for Conv2d (PixelPatchEmbed)
+  --no_compile_text        skip torch.compile on text encoders
 """
 import argparse
 import contextlib
@@ -25,16 +36,15 @@ from torch.distributed.fsdp import (
 )
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
-from diffusers import AutoencoderKL, StableDiffusion3Pipeline
-from pom_sd3.model import PomSD3Transformer2DModel
-from pom_sd3.convert import SD35_MEDIUM_CONFIG
+from diffusers import StableDiffusion3Pipeline
+from pom_sd3.convert import build_pixel_grouped
 
 
 # ---------------------------------------------------------------------------
-# Distributed helpers (mirrors train_scratch.py)
+# Distributed helpers
 # ---------------------------------------------------------------------------
 
-def setup_ddp():
+def setup_dist():
     if "RANK" in os.environ:
         dist.init_process_group("nccl")
         local_rank = int(os.environ["LOCAL_RANK"])
@@ -47,15 +57,26 @@ def is_main():
     return not dist.is_initialized() or dist.get_rank() == 0
 
 
-def world_size():
+def ws():
     return dist.get_world_size() if dist.is_initialized() else 1
 
 
-def wrap_model_fsdp(model, local_rank, gpus_per_node=None):
+def barrier():
+    if dist.is_initialized():
+        dist.barrier()
+
+
+# ---------------------------------------------------------------------------
+# FSDP wrapping
+# ---------------------------------------------------------------------------
+
+def wrap_fsdp(model, local_rank, args):
     if not dist.is_initialized():
         return model
+
     from diffusers.models.attention import JointTransformerBlock
     from pom_sd3.blocks import JointPoMBlock
+
     mp = MixedPrecision(
         param_dtype=torch.bfloat16,
         reduce_dtype=torch.bfloat16,
@@ -65,39 +86,33 @@ def wrap_model_fsdp(model, local_rank, gpus_per_node=None):
         transformer_auto_wrap_policy,
         transformer_layer_cls={JointPoMBlock, JointTransformerBlock},
     )
-    ws = world_size()
-    if gpus_per_node is not None and gpus_per_node < ws:
+    fsdp_kwargs = dict(
+        auto_wrap_policy=wrap_policy,
+        mixed_precision=mp,
+        device_id=local_rank,
+        forward_prefetch=args.forward_prefetch,
+        limit_all_gathers=not args.no_limit_all_gathers,
+        use_orig_params=args.use_orig_params,
+    )
+
+    gpus_per_node = args.gpus_per_node
+    world = ws()
+    if gpus_per_node is not None and gpus_per_node < world:
         rank      = dist.get_rank()
-        num_nodes = ws // gpus_per_node
+        num_nodes = world // gpus_per_node
         node_idx  = rank // gpus_per_node
-
-        all_intra = []
-        for n in range(num_nodes):
-            all_intra.append(dist.new_group(list(range(n * gpus_per_node,
-                                                       (n + 1) * gpus_per_node))))
-        all_inter = []
-        for g in range(gpus_per_node):
-            all_inter.append(dist.new_group(list(range(g, ws, gpus_per_node))))
-
+        all_intra = [dist.new_group(list(range(n * gpus_per_node, (n + 1) * gpus_per_node)))
+                     for n in range(num_nodes)]
+        all_inter = [dist.new_group(list(range(g, world, gpus_per_node)))
+                     for g in range(gpus_per_node)]
         intra_group = all_intra[node_idx]
         inter_group = all_inter[rank % gpus_per_node]
         if is_main():
             print(f"HYBRID_SHARD: {gpus_per_node} GPUs/node × {num_nodes} nodes")
-        return FSDP(
-            model,
-            sharding_strategy=ShardingStrategy.HYBRID_SHARD,
-            process_group=(intra_group, inter_group),
-            auto_wrap_policy=wrap_policy,
-            mixed_precision=mp,
-            device_id=local_rank,
-        )
-    return FSDP(
-        model,
-        sharding_strategy=ShardingStrategy.FULL_SHARD,
-        auto_wrap_policy=wrap_policy,
-        mixed_precision=mp,
-        device_id=local_rank,
-    )
+        return FSDP(model, sharding_strategy=ShardingStrategy.HYBRID_SHARD,
+                    process_group=(intra_group, inter_group), **fsdp_kwargs)
+
+    return FSDP(model, sharding_strategy=ShardingStrategy.FULL_SHARD, **fsdp_kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -105,26 +120,22 @@ def wrap_model_fsdp(model, local_rank, gpus_per_node=None):
 # ---------------------------------------------------------------------------
 
 class StepTimer:
-    """Accumulates per-step CUDA-event timings. Call .start()/.stop() around
-    each timed region; call .collect() once per step after cuda.synchronize()."""
-
     def __init__(self):
         self.samples: list[float] = []
-        self._start_ev = None
-        self._stop_ev = None
+        self._s = self._e = None
 
     def start(self):
-        self._start_ev = torch.cuda.Event(enable_timing=True)
-        self._start_ev.record()
+        self._s = torch.cuda.Event(enable_timing=True)
+        self._s.record()
 
     def stop(self):
-        self._stop_ev = torch.cuda.Event(enable_timing=True)
-        self._stop_ev.record()
+        self._e = torch.cuda.Event(enable_timing=True)
+        self._e.record()
 
     def collect(self):
-        if self._start_ev is not None and self._stop_ev is not None:
-            self.samples.append(self._start_ev.elapsed_time(self._stop_ev))
-            self._start_ev = self._stop_ev = None
+        if self._s is not None and self._e is not None:
+            self.samples.append(self._s.elapsed_time(self._e))
+            self._s = self._e = None
 
     @property
     def mean_ms(self):
@@ -136,78 +147,60 @@ class StepTimer:
 
 
 # ---------------------------------------------------------------------------
-# Dummy caption tokenisation for per-encoder breakdown
+# Argument parsing
 # ---------------------------------------------------------------------------
 
-def make_clip_tokens(tokenizer, captions, device):
-    toks = tokenizer(
-        captions,
-        padding="max_length",
-        max_length=77,
-        truncation=True,
-        return_tensors="pt",
-    )
-    return {k: v.to(device) for k, v in toks.items()}
-
-
-def make_t5_tokens(tokenizer, captions, max_seq_len, device):
-    toks = tokenizer(
-        captions,
-        padding="max_length",
-        max_length=max_seq_len,
-        truncation=True,
-        return_tensors="pt",
-    )
-    return {k: v.to(device) for k, v in toks.items() if k in ("input_ids", "attention_mask")}
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--model_id", required=True,
+                   help="SD3.5-medium path (provides text encoders only; no VAE used)")
+    # Pixel model
+    p.add_argument("--image_size",    type=int, default=512)
+    p.add_argument("--patch_size",    type=int, default=32)
+    p.add_argument("--bottleneck_dim",type=int, default=256)
+    p.add_argument("--pom_degree",    type=int, default=4)
+    p.add_argument("--pom_expand",    type=int, default=2)
+    p.add_argument("--pom_n_groups",  type=int, default=1)
+    p.add_argument("--pom_n_sel_heads", type=int, default=24)
+    # Training dims
+    p.add_argument("--batch_size",          type=int, default=32)
+    p.add_argument("--max_sequence_length", type=int, default=77)
+    # FSDP flags
+    p.add_argument("--gpus_per_node",       type=int, default=None)
+    p.add_argument("--forward_prefetch",    action="store_true",
+                   help="FSDP forward all-gather prefetch")
+    p.add_argument("--no_limit_all_gathers", action="store_true",
+                   help="Remove FSDP limit on concurrent all-gathers")
+    p.add_argument("--use_orig_params",     action="store_true",
+                   help="FSDP use_orig_params (required for --compile_model)")
+    # Compile
+    p.add_argument("--compile_model",  action="store_true",
+                   help="torch.compile the transformer (needs --use_orig_params)")
+    p.add_argument("--no_compile_text", action="store_true",
+                   help="Skip torch.compile on text encoders")
+    # Other
+    p.add_argument("--cudnn_benchmark", action="store_true",
+                   help="cuDNN autotuning (helps PixelPatchEmbed Conv2d)")
+    p.add_argument("--n_warmup", type=int, default=3)
+    p.add_argument("--n_steps",  type=int, default=10)
+    return p.parse_args()
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--model_id", required=True)
-    p.add_argument("--image_size", type=int, default=256)
-    p.add_argument("--batch_size", type=int, default=32)
-    p.add_argument("--hybrid_n", type=int, default=2)
-    p.add_argument("--pom_degree", type=int, default=4)
-    p.add_argument("--pom_expand", type=int, default=2)
-    p.add_argument("--pom_n_groups", type=int, default=1)
-    p.add_argument("--pom_n_sel_heads", type=int, default=24)
-    p.add_argument("--max_sequence_length", type=int, default=77,
-                   help="T5 token budget (SD3 default=256; 77 is the CLIP budget)")
-    p.add_argument("--gradient_checkpointing", action="store_true")
-    p.add_argument("--gpus_per_node", type=int, default=None,
-                   help="Enable HYBRID_SHARD: shard within node, replicate across nodes")
-    p.add_argument("--no_compile", action="store_true",
-                   help="Skip torch.compile on VAE and text encoders")
-    p.add_argument("--n_warmup", type=int, default=3,
-                   help="Steps before timing starts (lets torch.compile JIT finish)")
-    p.add_argument("--n_steps", type=int, default=10,
-                   help="Steps to time")
-    return p.parse_args()
-
-
 def main():
     args = parse_args()
-    local_rank = setup_ddp()
+    local_rank = setup_dist()
     device = torch.device(f"cuda:{local_rank}")
-    ws = world_size()
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    if args.cudnn_benchmark:
+        torch.backends.cudnn.benchmark = True
 
     _local = os.path.exists(args.model_id)
-
-    # ------------------------------------------------------------------ VAE
-    if is_main():
-        print("Loading VAE ...")
-    vae = AutoencoderKL.from_pretrained(
-        args.model_id, subfolder="vae",
-        torch_dtype=torch.bfloat16, local_files_only=_local,
-    ).to(device)
-    vae.requires_grad_(False)
-    vae.eval()
-    if not args.no_compile:
-        vae = torch.compile(vae, dynamic=True)
 
     # ------------------------------------------------------------------ Text encoders
     if is_main():
@@ -219,33 +212,32 @@ def main():
     for enc in (text_pipe.text_encoder, text_pipe.text_encoder_2, text_pipe.text_encoder_3):
         if enc is not None:
             enc.requires_grad_(False)
-    if not args.no_compile:
-        if text_pipe.text_encoder is not None:
-            text_pipe.text_encoder = torch.compile(text_pipe.text_encoder, dynamic=True)
-        if text_pipe.text_encoder_2 is not None:
-            text_pipe.text_encoder_2 = torch.compile(text_pipe.text_encoder_2, dynamic=True)
-        if text_pipe.text_encoder_3 is not None:
-            text_pipe.text_encoder_3 = torch.compile(text_pipe.text_encoder_3, dynamic=True)
+            enc.eval()
+    if not args.no_compile_text:
+        for attr in ("text_encoder", "text_encoder_2", "text_encoder_3"):
+            enc = getattr(text_pipe, attr, None)
+            if enc is not None:
+                setattr(text_pipe, attr, torch.compile(enc, dynamic=True))
 
-    # ------------------------------------------------------------------ Transformer
+    # ------------------------------------------------------------------ Pixel transformer
     if is_main():
-        print("Loading transformer ...")
-    model = PomSD3Transformer2DModel(
-        **SD35_MEDIUM_CONFIG,
-        n_pom_blocks=24,
+        print("Building pixel transformer ...")
+    model = build_pixel_grouped(
+        patch_size=args.patch_size,
+        bottleneck_dim=args.bottleneck_dim,
         pom_degree=args.pom_degree,
         pom_expand=args.pom_expand,
         pom_n_groups=args.pom_n_groups,
         pom_n_sel_heads=args.pom_n_sel_heads,
-        lora_rank=0,
-        hybrid_n=args.hybrid_n,
-        attention_window_m=4,
-    ).to(device=device, dtype=torch.bfloat16)
-
-    if args.gradient_checkpointing:
-        model.enable_gradient_checkpointing()
-
-    model = wrap_model_fsdp(model, local_rank, gpus_per_node=args.gpus_per_node)
+        torch_dtype=torch.bfloat16,
+        device=device,
+    )
+    model = wrap_fsdp(model, local_rank, args)
+    if args.compile_model:
+        if not args.use_orig_params:
+            if is_main():
+                print("WARNING: --compile_model without --use_orig_params may not work correctly.")
+        model = torch.compile(model, dynamic=False)
     model.train()
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
@@ -253,18 +245,22 @@ def main():
     # ------------------------------------------------------------------ Dummy data
     B = args.batch_size
     H = W = args.image_size
-    latent_size = H // 8
-    dummy_pixels = torch.randn(B, 3, H, W, device=device, dtype=torch.bfloat16)
+    dummy_pixels  = torch.randn(B, 3, H, W, device=device, dtype=torch.bfloat16)
     dummy_captions = ["a photo of a cat sitting on a couch"] * B
 
-    # Pre-tokenise for the per-encoder breakdown
-    clip_toks_1 = make_clip_tokens(text_pipe.tokenizer, dummy_captions, device)
-    clip_toks_2 = make_clip_tokens(text_pipe.tokenizer_2, dummy_captions, device)
-    t5_toks = make_t5_tokens(text_pipe.tokenizer_3, dummy_captions, args.max_sequence_length, device)
+    # Pre-tokenise per encoder for the breakdown timers
+    def make_tokens(tokenizer, captions, max_len):
+        toks = tokenizer(captions, padding="max_length", max_length=max_len,
+                         truncation=True, return_tensors="pt")
+        return {k: v.to(device) for k, v in toks.items()
+                if k in ("input_ids", "attention_mask")}
+
+    clip_toks_1 = make_tokens(text_pipe.tokenizer,   dummy_captions, 77)
+    clip_toks_2 = make_tokens(text_pipe.tokenizer_2,  dummy_captions, 77)
+    t5_toks     = make_tokens(text_pipe.tokenizer_3,  dummy_captions, args.max_sequence_length)
 
     # ------------------------------------------------------------------ Timers
     timers = {
-        "vae_encode":   StepTimer(),
         "clip_l":       StepTimer(),
         "clip_g":       StepTimer(),
         "t5":           StepTimer(),
@@ -276,55 +272,46 @@ def main():
 
     # ------------------------------------------------------------------ Benchmark loop
     total_steps = args.n_warmup + args.n_steps
+
+    flags = []
+    if args.forward_prefetch:      flags.append("forward_prefetch")
+    if args.no_limit_all_gathers:  flags.append("no_limit_all_gathers")
+    if args.use_orig_params:       flags.append("use_orig_params")
+    if args.compile_model:         flags.append("compile_model")
+    if args.cudnn_benchmark:       flags.append("cudnn_benchmark")
+    if args.no_compile_text:       flags.append("no_compile_text")
+    flag_str = ("+[" + ", ".join(flags) + "]") if flags else "baseline"
+
     if is_main():
-        ckpt_str = " +grad_ckpt" if args.gradient_checkpointing else ""
-        cmp_str = " no_compile" if args.no_compile else " +compile"
         print(f"\nRunning {args.n_warmup} warmup + {args.n_steps} timed steps "
-              f"(bs={B}, img={H}px, T5_seq={args.max_sequence_length}, "
-              f"ws={ws}{ckpt_str}{cmp_str}) ...\n")
+              f"(bs={B}×{ws()} GPUs, {H}px, patch={args.patch_size}, "
+              f"T5_seq={args.max_sequence_length}, {flag_str}) ...\n")
 
     optimizer.zero_grad(set_to_none=True)
 
     for step in range(total_steps):
         timing = step >= args.n_warmup
 
-        # VAE encode
-        t = timers["vae_encode"]
-        if timing:
-            t.start()
-        with torch.no_grad():
-            latents = vae.encode(dummy_pixels).latent_dist.sample()
-            x_0 = (latents - vae.config.shift_factor) * vae.config.scaling_factor
-        if timing:
-            t.stop()
-
-        # Per-encoder breakdown (runs the raw encoder, not encode_prompt)
+        # Per-encoder breakdown (raw encoder forward, not full encode_prompt)
         with torch.no_grad():
             t = timers["clip_l"]
-            if timing:
-                t.start()
+            if timing: t.start()
             _ = text_pipe.text_encoder(**clip_toks_1)
-            if timing:
-                t.stop()
+            if timing: t.stop()
 
             t = timers["clip_g"]
-            if timing:
-                t.start()
+            if timing: t.start()
             _ = text_pipe.text_encoder_2(**clip_toks_2)
-            if timing:
-                t.stop()
+            if timing: t.stop()
 
             t = timers["t5"]
-            if timing:
-                t.start()
+            if timing: t.start()
             _ = text_pipe.text_encoder_3(**t5_toks)
-            if timing:
-                t.stop()
+            if timing: t.stop()
 
-        # Full encode_prompt (includes tokenization overhead + all three encoders)
+        # Full encode_prompt (tokenisation + all three encoders)
         t = timers["encode_total"]
-        if timing:
-            t.start()
+        if timing: t.start()
         with torch.no_grad():
             enc_hs, _, pooled, _ = text_pipe.encode_prompt(
                 prompt=dummy_captions,
@@ -334,53 +321,51 @@ def main():
             )
         enc_hs = enc_hs.to(dtype=torch.bfloat16)
         pooled = pooled.to(dtype=torch.bfloat16)
-        if timing:
-            t.stop()
+        if timing: t.stop()
 
-        # Flow-matching noise
-        u = torch.sigmoid(torch.randn(B, device=device))
-        ts = (u * 999).clamp(1, 999).long()
-        sigma = (ts.float() / 1000).view(B, 1, 1, 1)
+        # JiT flow matching: t=0 noise, t=1 clean
+        # t_cont ~ LogitNormal(-0.8, 0.8) as in training
+        t_cont = torch.sigmoid(
+            torch.randn(B, device=device) * 0.8 + (-0.8)
+        )
+        t_int = ((1.0 - t_cont) * 999).long().clamp(0, 999)
+        t_view = t_cont.view(B, 1, 1, 1)
+        x_0 = dummy_pixels
         eps = torch.randn_like(x_0)
-        x_t = ((1 - sigma) * x_0 + sigma * eps).to(x_0.dtype)
+        z_t = t_view * x_0 + (1.0 - t_view) * eps
 
         # Transformer forward
         t = timers["fwd"]
-        if timing:
-            t.start()
-        v_pred = model(
-            hidden_states=x_t,
+        if timing: t.start()
+        x_pred = model(
+            hidden_states=z_t,
             encoder_hidden_states=enc_hs,
             pooled_projections=pooled,
-            timestep=ts,
+            timestep=t_int,
         ).sample
-        if timing:
-            t.stop()
+        if timing: t.stop()
 
-        # Loss + backward
-        v_target = (eps - x_0).to(v_pred.dtype)
-        loss = F.mse_loss(v_pred, v_target)
+        # x-prediction loss with (1-t)^2 weighting (JiT paper, clamp 5e-2)
+        one_minus_t = (1.0 - t_cont).clamp(min=5e-2)
+        loss_per = F.mse_loss(x_pred, x_0, reduction="none").mean(dim=(1, 2, 3))
+        loss = (loss_per / one_minus_t.pow(2)).mean()
+
         t = timers["bwd"]
-        if timing:
-            t.start()
+        if timing: t.start()
         loss.backward()
-        if timing:
-            t.stop()
+        if timing: t.stop()
 
         # Optimizer step
         t = timers["opt_step"]
-        if timing:
-            t.start()
+        if timing: t.start()
         if isinstance(model, FSDP):
             model.clip_grad_norm_(1.0)
         else:
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
-        if timing:
-            t.stop()
+        if timing: t.stop()
 
-        # Synchronise once per step, then collect all timers
         if timing:
             torch.cuda.synchronize()
             for tmr in timers.values():
@@ -391,69 +376,58 @@ def main():
 
     # ------------------------------------------------------------------ Report
     if not is_main():
-        dist.barrier() if dist.is_initialized() else None
+        barrier()
         return
 
-    # Build rows
     rows = [
-        ("VAE encode",       timers["vae_encode"]),
-        ("CLIP-L",           timers["clip_l"]),
-        ("CLIP-G",           timers["clip_g"]),
+        ("CLIP-L",                timers["clip_l"]),
+        ("CLIP-G",                timers["clip_g"]),
         (f"T5 (seq={args.max_sequence_length})", timers["t5"]),
-        ("encode_prompt total", timers["encode_total"]),
-        ("Transformer fwd",  timers["fwd"]),
-        ("Transformer bwd",  timers["bwd"]),
-        ("Optimizer step",   timers["opt_step"]),
+        ("encode_prompt total",   timers["encode_total"]),
+        ("Transformer fwd",       timers["fwd"]),
+        ("Transformer bwd",       timers["bwd"]),
+        ("Optimizer step",        timers["opt_step"]),
     ]
 
-    # Step total: encode_total + fwd + bwd + vae_encode + opt_step
-    step_ms = (timers["vae_encode"].mean_ms
-               + timers["encode_total"].mean_ms
+    step_ms = (timers["encode_total"].mean_ms
                + timers["fwd"].mean_ms
                + timers["bwd"].mean_ms
                + timers["opt_step"].mean_ms)
 
     print()
-    print("=" * 72)
-    ckpt_str = " +gradient_checkpointing" if args.gradient_checkpointing else ""
-    cmp_str  = " (no torch.compile)" if args.no_compile else " (+torch.compile)"
-    print(f"  Speed breakdown — bs={B}×{ws} GPUs, {H}px, "
-          f"T5_seq={args.max_sequence_length}{ckpt_str}{cmp_str}")
-    print("=" * 72)
-    print(f"{'Component':<30} {'Mean (ms)':>10} {'±Std':>8} {'% of step':>10}")
-    print("-" * 72)
+    print("=" * 76)
+    print(f"  Pixel-space speed breakdown — {flag_str}")
+    print(f"  bs={B}×{ws()} GPUs · {H}px · patch={args.patch_size} · "
+          f"T5_seq={args.max_sequence_length}")
+    print("=" * 76)
+    print(f"  {'Component':<32} {'Mean (ms)':>10} {'±Std':>8} {'% of step':>10}")
+    print("-" * 76)
     for label, tmr in rows:
         pct = 100.0 * tmr.mean_ms / step_ms if step_ms > 0 else 0.0
-        print(f"  {label:<28} {tmr.mean_ms:>10.1f} {tmr.std_ms:>8.1f} {pct:>9.1f}%")
-    print("-" * 72)
-    print(f"  {'Step total (estimated)':<28} {step_ms:>10.1f}")
-    sps = B * ws / (step_ms / 1000.0)
-    print(f"  {'Throughput':<28} {sps:>10.0f} samp/s")
-    print("=" * 72)
+        print(f"  {label:<32} {tmr.mean_ms:>10.1f} {tmr.std_ms:>8.1f} {pct:>9.1f}%")
+    print("-" * 76)
+    print(f"  {'Step total (estimated)':<32} {step_ms:>10.1f}")
+    sps = B * ws() / (step_ms / 1000.0)
+    print(f"  {'Throughput':<32} {sps:>10.0f} samp/s")
+    print("=" * 76)
 
-    # Highlight the biggest component
     biggest = max(rows, key=lambda r: r[1].mean_ms)
     pct_biggest = 100.0 * biggest[1].mean_ms / step_ms
     print(f"\n  Bottleneck: {biggest[0]} ({pct_biggest:.0f}% of step)")
 
-    note_enc = timers["encode_total"].mean_ms
-    note_t5  = timers["t5"].mean_ms
-    note_fwd = timers["fwd"].mean_ms
-    note_bwd = timers["bwd"].mean_ms
-    if note_enc > note_fwd + note_bwd:
-        print("  → Caching VAE latents and/or text embeddings would give the biggest speedup.")
-        if note_t5 > 0.5 * note_enc:
-            print(f"  → T5 alone is {100*note_t5/note_enc:.0f}% of encoding cost; "
-                  f"try --max_sequence_length 77 if using 256.")
+    enc_ms  = timers["encode_total"].mean_ms
+    fwdbwd  = timers["fwd"].mean_ms + timers["bwd"].mean_ms
+    t5_ms   = timers["t5"].mean_ms
+    if enc_ms > fwdbwd:
+        print("  → Text encoding dominates. Caching embeddings would give the biggest gain.")
+        if t5_ms > 0.5 * enc_ms:
+            print(f"  → T5 is {100*t5_ms/enc_ms:.0f}% of encoding cost — "
+                  f"rank-0-only encoding or pre-computation is the key lever.")
     else:
-        print("  → Transformer is the bottleneck; encoding optimisations will have limited effect.")
-        if args.gradient_checkpointing:
-            fwd_frac = note_fwd / (note_fwd + note_bwd) if note_fwd + note_bwd > 0 else 0
-            print(f"  → Backward is {100*(1-fwd_frac):.0f}% of fwd+bwd — "
-                  f"gradient checkpointing overhead is visible.")
+        print("  → Transformer fwd+bwd dominates. "
+              "FSDP overlap and torch.compile are the main levers.")
 
-    if dist.is_initialized():
-        dist.barrier()
+    barrier()
 
 
 if __name__ == "__main__":
