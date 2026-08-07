@@ -12,7 +12,7 @@ Model predicts x_pred (clean image). Loss:
 Timestep conditioning: t_int = round((1−t_cont) · 999)  (high int = high noise,
 consistent with SD3's CombinedTimestepTextProjEmbeddings convention).
 
-Noise scale: ε ~ N(0, (patch_size/16)² · I)  — matches JiT's SNR normalisation.
+Noise scale: ε ~ N(0, 0.4² · I)  — matches pixel data std ≈ 0.4, giving unit SNR at t=0.5.
 """
 
 import argparse
@@ -111,6 +111,7 @@ def wrap_model_fsdp(model: torch.nn.Module, local_rank: int,
             mixed_precision=mp,
             device_id=local_rank,
             forward_prefetch=True,
+            use_orig_params=True,
         )
     return FSDP(
         model,
@@ -119,6 +120,7 @@ def wrap_model_fsdp(model: torch.nn.Module, local_rank: int,
         mixed_precision=mp,
         device_id=local_rank,
         forward_prefetch=True,
+        use_orig_params=True,
     )
 
 
@@ -339,6 +341,16 @@ SAMPLE_PROMPTS = [
     "a futuristic space station interior, hard sci-fi concept art",
     "cherry blossom trees along a river in spring, Japan",
     "a close-up of a honeybee on a sunflower, macro photography",
+    "a surrealist painting of melting clocks in a desert landscape",
+    "a Viking longship on a stormy sea, dramatic lighting",
+    "a bustling street market in Marrakech, golden hour",
+    "an Art Deco poster of a luxury ocean liner",
+    "a snowy owl in flight against a pale winter sky",
+    "an underwater coral reef teeming with colorful fish",
+    "a steampunk airship over a Victorian city, detailed illustration",
+    "a minimalist ink drawing of a mountain range",
+    "a wolf howling at the full moon in a pine forest, night",
+    "a child blowing dandelion seeds in a summer meadow, soft focus",
 ]
 
 
@@ -476,18 +488,17 @@ def generate_samples_pixel(
     if is_main():
         print(f"Generating pixel samples at step {step} ...")
 
-    noise_scale = patch_size / 16.0
+    noise_scale = 0.4  # matches pixel data std → unit SNR at t=0.5
     prompts = SAMPLE_PROMPTS[:num_prompts]
+    B = len(prompts)
 
     # All ranks encode text independently (not collective), same inputs → same outputs
     with _silence_encoding_noise():
         enc_hs, pooled = fast_encode_prompt(text_pipe, prompts, 77, device)
     enc_hs  = enc_hs.to(device=device,  dtype=torch.bfloat16)
     pooled  = pooled.to(device=device,  dtype=torch.bfloat16)
-    null_eh = null_enc_hs.expand(num_prompts, -1, -1).to(device=device, dtype=torch.bfloat16)
-    null_p  = null_pooled.expand(num_prompts, -1).to(device=device,  dtype=torch.bfloat16)
-
-    B = num_prompts
+    null_eh = null_enc_hs.expand(B, -1, -1).to(device=device, dtype=torch.bfloat16)
+    null_p  = null_pooled.expand(B, -1).to(device=device,  dtype=torch.bfloat16)
     dt = 1.0 / num_steps
 
     # Fixed seed so all ranks generate the same initial noise
@@ -795,7 +806,7 @@ def main():
     )
 
     # --- Training loop ---
-    noise_scale = args.patch_size / 16.0  # ε ~ N(0, noise_scale² · I)
+    noise_scale = 0.4  # ε ~ N(0, noise_scale² · I); matches pixel data std ≈ 0.4 → unit SNR at t=0.5
     start_step = step
     t0 = time.time()
 
@@ -932,7 +943,7 @@ def main():
                 patch_size=args.patch_size,
                 null_enc_hs=null_enc_hs,
                 null_pooled=null_pooled,
-                num_prompts=25,
+                num_prompts=args.num_sample_prompts,
                 num_steps=args.num_sample_steps,
                 guidance_scale=args.guidance_scale,
             )

@@ -68,13 +68,13 @@ srun torchrun \
         --grad_accum_steps 4 \
         --lr 1e-3 \
         --warmup_steps 2000 \
-        --logit_normal_mean -0.8 \
+        --logit_normal_mean 0.0 \
         --logit_normal_std 0.8 \
         --max_steps 1000000 \
         --log_every 500 \
         --save_every 40000 \
         --sample_every 20000 \
-        --num_sample_prompts 4 \
+        --num_sample_prompts 25 \
         --num_sample_steps 50 \
         --guidance_scale 4.0 \
         --wandb_project pixel-pom-g16 \
