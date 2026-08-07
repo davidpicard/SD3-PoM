@@ -560,6 +560,147 @@ def generate_samples_pixel(
 
 
 # ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+# JiT convention: t_cont in (0,1), 0=noise, 1=clean. 20 pts: 0.025, 0.075, …, 0.975.
+_VAL_T_CONT = [(2 * i + 1) / 40 for i in range(20)]
+_VAL_T_INT  = [round((1.0 - tc) * 999) for tc in _VAL_T_CONT]
+
+
+def load_val_cache_pixel(dataset_dir, n_val, image_size, text_pipe, max_seq_len, device):
+    """Load first n_val images from the gpic val split (first tar, center crop, deterministic).
+
+    Called identically on all ranks so every rank holds the same tensors for FSDP collectives.
+    Returns (x0_cache, enc_hs_cache, pooled_cache) on CPU, or None when unavailable.
+    """
+    import glob as _glob, tarfile, json as _json
+    from io import BytesIO
+    from PIL import Image as PILImage
+
+    if not dataset_dir:
+        return None
+    val_tars = sorted(_glob.glob(os.path.join(dataset_dir, "val", "*.tar")))
+    if not val_tars:
+        return None
+
+    pixel_list, caption_list = [], []
+    with tarfile.open(val_tars[0], "r:") as tf:
+        pending: dict = {}
+        for member in tf:
+            if not member.isfile() or "." not in member.name:
+                continue
+            base, ext = member.name.rsplit(".", 1)
+            f = tf.extractfile(member)
+            if f is None:
+                continue
+            data = f.read()
+            entry = pending.setdefault(base, {})
+            if ext == "json":
+                entry["json"] = data
+            elif ext in ("jpg", "jpeg", "png"):
+                entry["img"] = data
+            if "json" not in entry or "img" not in entry:
+                continue
+            del pending[base]
+            try:
+                meta = _json.loads(entry["json"])
+                img = PILImage.open(BytesIO(entry["img"])).convert("RGB")
+            except Exception:
+                continue
+            caption = meta.get("caption", "")
+            if not caption:
+                continue
+            img = transforms.functional.resize(
+                img, image_size, interpolation=transforms.InterpolationMode.BICUBIC
+            )
+            w, h = img.size
+            top, left = (h - image_size) // 2, (w - image_size) // 2
+            img = transforms.functional.crop(img, top, left, image_size, image_size)
+            img_t = transforms.functional.to_tensor(img)
+            img_t = transforms.functional.normalize(img_t, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+            pixel_list.append(img_t)
+            caption_list.append(caption)
+            if len(pixel_list) >= n_val:
+                break
+
+    if not pixel_list:
+        return None
+    n = len(pixel_list)
+    x0_cache = torch.stack(pixel_list)  # (n, 3, H, W) — raw pixels, CPU
+
+    enc_hs_parts, pooled_parts = [], []
+    with _silence_encoding_noise():
+        for i in range(0, n, 32):
+            eh, pl = fast_encode_prompt(text_pipe, caption_list[i:i+32], max_seq_len, device)
+            enc_hs_parts.append(eh.cpu())
+            pooled_parts.append(pl.cpu())
+    enc_hs_cache = torch.cat(enc_hs_parts)  # (n, seq, 4096)
+    pooled_cache  = torch.cat(pooled_parts)  # (n, 2048)
+
+    if is_main():
+        print(f"Val cache: {n} images from {os.path.basename(val_tars[0])}")
+    return x0_cache, enc_hs_cache, pooled_cache
+
+
+@torch.no_grad()
+def run_validation_pixel(model, val_cache, noise_scale, step, device):
+    """Deterministic val pass: fixed (image, t_cont, noise) triples, unweighted x-pred MSE.
+
+    All ranks participate (FSDP collective). Only rank 0 logs.
+    """
+    if val_cache is None:
+        return
+    x0_cache, enc_hs_cache, pooled_cache = val_cache
+    n = x0_cache.shape[0]
+    n_t = len(_VAL_T_CONT)
+
+    model.eval()
+    # Buckets: high_noise t_cont<0.33, mid 0.33-0.67, low_noise >=0.67
+    bucket_losses: dict[str, list] = {"high": [], "mid": [], "low": []}
+    bucket_psnr:   dict[str, list] = {"high": [], "mid": [], "low": []}
+
+    for t_idx, (t_cont, t_int) in enumerate(zip(_VAL_T_CONT, _VAL_T_INT)):
+        bucket = "high" if t_cont < 0.33 else ("low" if t_cont >= 0.67 else "mid")
+        for start in range(0, n, 32):
+            end = min(start + 32, n)
+            B = end - start
+            x_0    = x0_cache[start:end].to(device=device, dtype=torch.bfloat16)
+            enc_hs = enc_hs_cache[start:end].to(device=device, dtype=torch.bfloat16)
+            pooled = pooled_cache[start:end].to(device=device, dtype=torch.bfloat16)
+            # Noise seeded deterministically by (global_img_idx, t_idx)
+            eps = torch.stack([
+                torch.randn(x_0.shape[1:],
+                            generator=torch.Generator().manual_seed(i * n_t + t_idx))
+                for i in range(start, end)
+            ]).to(device=device, dtype=torch.bfloat16) * noise_scale
+            tv   = torch.full((B, 1, 1, 1), t_cont, device=device, dtype=torch.bfloat16)
+            z_t  = tv * x_0 + (1.0 - tv) * eps
+            t_tensor = torch.full((B,), t_int, device=device, dtype=torch.long)
+            x_pred = model(hidden_states=z_t, encoder_hidden_states=enc_hs,
+                           pooled_projections=pooled, timestep=t_tensor).sample
+            mse = F.mse_loss(x_pred, x_0, reduction="none").mean(dim=(1, 2, 3)).float().cpu()
+            # Pixels in [-1,1]: peak² = 4  →  PSNR = 10·log10(4/MSE)
+            psnr = 10.0 * torch.log10(4.0 / mse.clamp(min=1e-10))
+            bucket_losses[bucket].extend(mse.tolist())
+            bucket_psnr[bucket].extend(psnr.tolist())
+
+    model.train()
+
+    if not is_main():
+        return
+    log = {"step": step}
+    for key in ("high", "mid", "low"):
+        if bucket_losses[key]:
+            log[f"val_loss_{key}_noise"] = sum(bucket_losses[key]) / len(bucket_losses[key])
+            log[f"val_psnr_{key}_noise"] = sum(bucket_psnr[key])   / len(bucket_psnr[key])
+    wandb.log(log, step=step)
+    parts = [f"{k}: loss={log[f'val_loss_{k}_noise']:.4f}  psnr={log[f'val_psnr_{k}_noise']:.2f}dB"
+             for k in ("high", "mid", "low") if f"val_loss_{k}_noise" in log]
+    print(f"step={step:7d}  val: {',  '.join(parts)}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -615,6 +756,8 @@ def parse_args():
     p.add_argument("--log_every", type=int, default=500)
     p.add_argument("--save_every", type=int, default=40_000)
     p.add_argument("--sample_every", type=int, default=20_000)
+    p.add_argument("--val_every", type=int, default=10_000)
+    p.add_argument("--n_val_images", type=int, default=256)
     p.add_argument("--num_sample_prompts", type=int, default=25)
     p.add_argument("--num_sample_steps", type=int, default=50)
     p.add_argument("--guidance_scale", type=float, default=4.0)
@@ -805,8 +948,16 @@ def main():
         collate_fn=gpic_collate,
     )
 
-    # --- Training loop ---
+    # --- Validation cache (fixed images + text encodings, loaded once) ---
     noise_scale = 0.4  # ε ~ N(0, noise_scale² · I); matches pixel data std ≈ 0.4 → unit SNR at t=0.5
+    val_cache = None
+    if not args.smoke_test and text_pipe is not None and args.val_every > 0:
+        val_cache = load_val_cache_pixel(
+            args.dataset_dir, args.n_val_images, args.image_size,
+            text_pipe, args.max_sequence_length, device,
+        )
+
+    # --- Training loop ---
     start_step = step
     t0 = time.time()
 
@@ -930,6 +1081,10 @@ def main():
             save_checkpoint(model, optimizer, step, ckpt_dir)
             if is_main():
                 print(f"Saved checkpoint to {ckpt_dir}")
+
+        # --- Validation ---
+        if step > 0 and args.val_every > 0 and step % args.val_every == 0 and not args.smoke_test:
+            run_validation_pixel(model, val_cache, noise_scale, step, device)
 
         # --- Sample generation ---
         if step > 0 and step % args.sample_every == 0 and not args.smoke_test:

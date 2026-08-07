@@ -767,6 +767,151 @@ def generate_samples(model, vae, text_pipe, step: int, device, num_prompts: int 
 
 
 # ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+_VAL_SIGMAS = [(2 * i + 1) / 40 for i in range(20)]   # 20 pts: 0.025, 0.075, …, 0.975
+_VAL_T_INTS = [round(s * 999) for s in _VAL_SIGMAS]
+
+
+def load_val_cache(dataset_dir, n_val, image_size, text_pipe, max_seq_len, device, vae):
+    """Load first n_val images from the gpic val split (first tar, center crop, deterministic).
+
+    Called identically on all ranks so every rank holds the same tensors for FSDP collectives.
+    Returns (x0_cache, enc_hs_cache, pooled_cache) on CPU, or None when unavailable.
+    """
+    import glob as _glob, tarfile, json as _json
+    from io import BytesIO
+    from PIL import Image as PILImage
+
+    if not dataset_dir:
+        return None
+    val_tars = sorted(_glob.glob(os.path.join(dataset_dir, "val", "*.tar")))
+    if not val_tars:
+        return None
+
+    pixel_list, caption_list = [], []
+    with tarfile.open(val_tars[0], "r:") as tf:
+        pending: dict = {}
+        for member in tf:
+            if not member.isfile() or "." not in member.name:
+                continue
+            base, ext = member.name.rsplit(".", 1)
+            f = tf.extractfile(member)
+            if f is None:
+                continue
+            data = f.read()
+            entry = pending.setdefault(base, {})
+            if ext == "json":
+                entry["json"] = data
+            elif ext in ("jpg", "jpeg", "png"):
+                entry["img"] = data
+            if "json" not in entry or "img" not in entry:
+                continue
+            del pending[base]
+            try:
+                meta = _json.loads(entry["json"])
+                img = PILImage.open(BytesIO(entry["img"])).convert("RGB")
+            except Exception:
+                continue
+            caption = meta.get("caption", "")
+            if not caption:
+                continue
+            img = transforms.functional.resize(
+                img, image_size, interpolation=transforms.InterpolationMode.BICUBIC
+            )
+            w, h = img.size
+            top, left = (h - image_size) // 2, (w - image_size) // 2
+            img = transforms.functional.crop(img, top, left, image_size, image_size)
+            img_t = transforms.functional.to_tensor(img)
+            img_t = transforms.functional.normalize(img_t, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+            pixel_list.append(img_t)
+            caption_list.append(caption)
+            if len(pixel_list) >= n_val:
+                break
+
+    if not pixel_list:
+        return None
+    n = len(pixel_list)
+    pixels = torch.stack(pixel_list)  # (n, 3, H, W)
+
+    # VAE encode → latents
+    x0_parts = []
+    with torch.no_grad():
+        for i in range(0, n, 16):
+            batch = pixels[i:i+16].to(device=device, dtype=torch.bfloat16)
+            lat = vae.encode(batch).latent_dist.sample()
+            x0_parts.append(((lat - vae.config.shift_factor) * vae.config.scaling_factor).cpu())
+    x0_cache = torch.cat(x0_parts)  # (n, 16, H//8, W//8)
+
+    # Text encode in batches
+    enc_hs_parts, pooled_parts = [], []
+    with _silence_encoding_noise():
+        for i in range(0, n, 32):
+            eh, pl = fast_encode_prompt(text_pipe, caption_list[i:i+32], max_seq_len, device)
+            enc_hs_parts.append(eh.cpu())
+            pooled_parts.append(pl.cpu())
+    enc_hs_cache = torch.cat(enc_hs_parts)  # (n, seq, 4096)
+    pooled_cache  = torch.cat(pooled_parts)  # (n, 2048)
+
+    if is_main():
+        print(f"Val cache: {n} images from {os.path.basename(val_tars[0])}")
+    return x0_cache, enc_hs_cache, pooled_cache
+
+
+@torch.no_grad()
+def run_validation(model, val_cache, step, device):
+    """Deterministic val pass: fixed (image, sigma, noise) triples, unweighted v-pred MSE.
+
+    All ranks participate (FSDP collective). Only rank 0 logs.
+    """
+    if val_cache is None:
+        return
+    x0_cache, enc_hs_cache, pooled_cache = val_cache
+    n = x0_cache.shape[0]
+    n_t = len(_VAL_SIGMAS)
+
+    model.eval()
+    bucket_losses: dict[str, list] = {"low": [], "mid": [], "high": []}
+
+    for t_idx, (sigma, t_int) in enumerate(zip(_VAL_SIGMAS, _VAL_T_INTS)):
+        bucket = "low" if t_int < 334 else ("high" if t_int >= 667 else "mid")
+        for start in range(0, n, 32):
+            end = min(start + 32, n)
+            B = end - start
+            x_0    = x0_cache[start:end].to(device=device, dtype=torch.bfloat16)
+            enc_hs = enc_hs_cache[start:end].to(device=device, dtype=torch.bfloat16)
+            pooled = pooled_cache[start:end].to(device=device, dtype=torch.bfloat16)
+            # Noise seeded deterministically by (global_img_idx, t_idx)
+            eps = torch.stack([
+                torch.randn(x_0.shape[1:],
+                            generator=torch.Generator().manual_seed(i * n_t + t_idx))
+                for i in range(start, end)
+            ]).to(device=device, dtype=torch.bfloat16)
+            sv  = torch.full((B, 1, 1, 1), sigma, device=device, dtype=torch.bfloat16)
+            x_t = (1.0 - sv) * x_0 + sv * eps
+            t_tensor = torch.full((B,), t_int, device=device, dtype=torch.long)
+            v_pred   = model(hidden_states=x_t, encoder_hidden_states=enc_hs,
+                             pooled_projections=pooled, timestep=t_tensor).sample
+            v_target = (eps - x_0).to(v_pred.dtype)
+            mse = F.mse_loss(v_pred, v_target, reduction="none").mean(dim=(1, 2, 3))
+            bucket_losses[bucket].extend(mse.float().cpu().tolist())
+
+    model.train()
+
+    if not is_main():
+        return
+    log = {"step": step}
+    for key, losses in bucket_losses.items():
+        if losses:
+            log[f"val_loss_{key}_t"] = sum(losses) / len(losses)
+    wandb.log(log, step=step)
+    parts = [f"{k}={log[f'val_loss_{k}_t']:.4f}"
+             for k in ("low", "mid", "high") if f"val_loss_{k}_t" in log]
+    print(f"step={step:7d}  val: {',  '.join(parts)}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -859,6 +1004,8 @@ def parse_args():
     p.add_argument("--log_every", type=int, default=50)
     p.add_argument("--save_every", type=int, default=5_000)
     p.add_argument("--sample_every", type=int, default=5_000)
+    p.add_argument("--val_every", type=int, default=10_000)
+    p.add_argument("--n_val_images", type=int, default=256)
     p.add_argument("--num_sample_prompts", type=int, default=25)
     p.add_argument("--wandb_project", default="sd3-pom-scratch")
     p.add_argument("--wandb_run_name", default=None)
@@ -1122,6 +1269,14 @@ def main():
         collate_fn=gpic_collate,
     )
 
+    # --- Validation cache (fixed images + text encodings, loaded once) ---
+    val_cache = None
+    if not args.smoke_test and text_pipe is not None and vae is not None and args.val_every > 0:
+        val_cache = load_val_cache(
+            args.dataset_dir, args.n_val_images, args.image_size,
+            text_pipe, args.max_sequence_length, device, vae,
+        )
+
     # --- Training loop ---
     start_step = step
     t0 = time.time()
@@ -1263,6 +1418,10 @@ def main():
             save_checkpoint(model, optimizer, step, ckpt_dir)
             if is_main():
                 print(f"Saved checkpoint to {ckpt_dir}")
+
+        # --- Validation ---
+        if step > 0 and args.val_every > 0 and step % args.val_every == 0 and not args.smoke_test:
+            run_validation(model, val_cache, step, device)
 
         # --- Sample generation ---
         if step > 0 and step % args.sample_every == 0 and not args.smoke_test:
