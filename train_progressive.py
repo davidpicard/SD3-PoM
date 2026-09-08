@@ -252,6 +252,7 @@ def parse_args():
     p.add_argument("--val_every", type=int, default=10_000)
     p.add_argument("--n_val_images", type=int, default=256)
     p.add_argument("--num_sample_prompts", type=int, default=25)
+    p.add_argument("--gradient_checkpointing", action="store_true")
     p.add_argument("--wandb_project", default="sd3-pom-progressive")
     p.add_argument("--wandb_run_name", default=None)
     p.add_argument("--wandb_offline", action="store_true")
@@ -383,6 +384,9 @@ def main():
     if is_main():
         print_model_summary(model, label="progressive (initially frozen)")
         print_model_layers(model)
+
+    if args.gradient_checkpointing:
+        model.enable_gradient_checkpointing()
 
     # FSDP wrap — requires_grad=False params are not reduced (FSDP + use_orig_params=True)
     model = wrap_model_fsdp(model, local_rank, gpus_per_node=args.gpus_per_node)

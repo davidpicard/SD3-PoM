@@ -76,6 +76,7 @@ srun torchrun \
         --sample_every 20000 \
         --val_every 10000 \
         --n_val_images 256 \
+        --gradient_checkpointing \
         --num_sample_prompts 25 \
         --wandb_project pom-progressive \
         --wandb_offline &
