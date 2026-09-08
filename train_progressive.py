@@ -1,30 +1,25 @@
-"""Progressive PoM replacement training.
+"""Progressive PoM replacement: start from pretrained SD3.5, activate one
+block at a time from the end, keeping every 4th block as attention.
 
-Starts with SD3.5 attention model and replaces one block at a time (from the output end)
-with JointPoMBlock+LoRA. At each stage the hybrid model keeps its denoising capability
-(frozen attention blocks carry the load) while the newly-inserted PoM block is trained
-with a clean gradient signal.
+Architecture (24 blocks):
+  att(0), pom(1..3), att(4), pom(5..7), att(8), pom(9..11),
+  att(12), pom(13..15), att(16), pom(17..19), att(20), pom(21..23)
 
-Schedule (default --replacement_step_schedule 1000):
-  step 0      : 1 PoM block (block 23) + proj_out LoRA
-  step 1000   : 2 PoM blocks (blocks 22-23)
-  ...
-  step 23000  : 24 PoM blocks (fully PoM) — hand off to train_finetune.py
+Activation order (end → front): 23, 22, 21, 20, 19, ..., 1, 0
+Every --phase_steps training steps, the next block is unfrozen:
+  - PoM block: randomly initialised; starts contributing when activated.
+  - Att block: pretrained SD3.5 weights; adapts at --pretrained_lr_scale × lr.
 
-Launch with torchrun (SLURM handles multi-node):
-    torchrun --nproc_per_node=4 --nnodes=4 \\
-        --rdzv_id=$SLURM_JOB_ID --rdzv_backend=c10d --rdzv_endpoint=$MASTER_ADDR:29500 \\
-        train_progressive.py --model_id /path/to/sd3.5-medium ...
-
-Or run locally for a smoke test:
-    python train_progressive.py --embeddings_dir ./embeddings --output_dir ./output \\
-        --smoke_test --n_pom_blocks_start 1 --replacement_step_schedule 2
+Launch:
+    torchrun --nproc_per_node=4 --nnodes=2 ... train_progressive.py ...
 """
 import argparse
 import contextlib
+import functools
 import json
 import math
 import os
+import re
 import random
 import shutil
 import sys
@@ -35,323 +30,169 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    FullStateDictConfig,
+    MixedPrecision,
+    ShardingStrategy,
+    StateDictType,
+)
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from torch.utils.data import DataLoader
+from safetensors.torch import save_file as safetensors_save_file
 
 import wandb
-from diffusers import (
-    AutoencoderKL,
-    SD3Transformer2DModel,
-    FlowMatchEulerDiscreteScheduler,
-    StableDiffusion3Pipeline,
-)
+from diffusers import AutoencoderKL, SD3Transformer2DModel, StableDiffusion3Pipeline
 from diffusers.models.attention import JointTransformerBlock
 from torchvision import transforms
 
-from dataset import CaptionDataset, EmbeddingDataset, caption_collate_fn
-from pom_sd3 import (
-    PomSD3Transformer2DModel,
-    build_from_sd3_pretrained,
-    replace_next_attention_block,
+from pom_sd3 import PomSD3Transformer2DModel
+from pom_sd3.blocks import JointPoMBlock
+
+# Re-use helpers and data loading from train_scratch.py
+from train_scratch import (
+    _silence_encoding_noise,
+    fast_encode_prompt,
+    setup_ddp,
+    cleanup_ddp,
+    is_main,
+    GPicDataset,
+    gpic_collate,
+    generate_samples,
+    load_val_cache,
+    run_validation,
+    find_latest_checkpoint,
+    save_checkpoint,
+    load_optimizer_fsdp,
+    load_checkpoint_optimizer,
+    wrap_model_fsdp,
+    lr_schedule,
+    print_model_summary,
+    print_model_layers,
+    _VAL_SIGMAS,
+    _VAL_T_INTS,
+    SAMPLE_PROMPTS,
 )
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Architecture constants
 # ---------------------------------------------------------------------------
 
-@contextlib.contextmanager
-def _silence_encoding_noise():
-    """Suppress tokenizer noise during encode_prompt.
+ATT_KEEP = frozenset(range(0, 24, 4))          # {0, 4, 8, 12, 16, 20}
+POM_LAYERS = tuple(i for i in range(24) if i not in ATT_KEEP)
+# Activation order: unfreeze from the end toward the front
+ACTIVATION_ORDER = list(range(23, -1, -1))      # [23, 22, 21, ..., 0]
 
-    Covers two channels:
-    - fd 2 / sys.stderr: the Rust fast-tokenizer writes directly to fd 2,
-      bypassing Python's logging system.
-    - transformers.tokenization_utils_base logger: emits the
-      "Token indices sequence length is longer than …" warning via Python
-      logging, which wandb captures through its root-logger handler.
-      Raising the level to ERROR for the duration prevents it from
-      appearing in wandb logs.
+
+# ---------------------------------------------------------------------------
+# Model construction
+# ---------------------------------------------------------------------------
+
+def build_progressive_model(
+    model_id: str,
+    pom_degree: int,
+    pom_expand: int,
+    pom_n_groups: int,
+    pom_n_sel_heads: int,
+    pom_rope_max_seq_len: int,
+    torch_dtype: torch.dtype,
+    device,
+) -> PomSD3Transformer2DModel:
+    """Build interleaved att+PoM model, weights from pretrained SD3.5.
+
+    Att blocks (0,4,8,12,16,20): all weights loaded from checkpoint.
+    PoM blocks: FF/norm weights loaded; attention replaced with random PoM.
     """
-    import logging as _logging
-    tok_logger = _logging.getLogger("transformers.tokenization_utils_base")
-    old_level = tok_logger.level
-    tok_logger.setLevel(_logging.ERROR)
+    _local = Path(model_id).exists()
+    model = PomSD3Transformer2DModel(
+        sample_size=128, patch_size=2, in_channels=16, num_layers=24,
+        attention_head_dim=64, num_attention_heads=24,
+        joint_attention_dim=4096, caption_projection_dim=1536,
+        pooled_projection_dim=2048, out_channels=16, pos_embed_max_size=384,
+        dual_attention_layers=tuple(range(13)),   # 0..12, same as SD3.5 Medium
+        pom_layers=POM_LAYERS,
+        qk_norm="rms_norm",
+        pom_degree=pom_degree,
+        pom_expand=pom_expand,
+        pom_n_groups=pom_n_groups,
+        pom_n_sel_heads=pom_n_sel_heads,
+        pom_rope_max_seq_len=pom_rope_max_seq_len,
+        lora_rank=0,
+    ).to(dtype=torch_dtype)
 
-    old_fd = os.dup(2)
-    devnull_fd = os.open(os.devnull, os.O_WRONLY)
-    os.dup2(devnull_fd, 2)
-    os.close(devnull_fd)
-    old_stderr = sys.stderr
-    sys.stderr = open(os.devnull, "w")
-    try:
-        yield
-    finally:
-        sys.stderr.flush()
-        sys.stderr.close()
-        sys.stderr = old_stderr
-        os.dup2(old_fd, 2)
-        os.close(old_fd)
-        tok_logger.setLevel(old_level)
+    if is_main():
+        print(f"Loading pretrained SD3.5 weights from {model_id} ...")
+    sd = SD3Transformer2DModel.from_pretrained(
+        model_id, subfolder="transformer",
+        torch_dtype=torch_dtype, local_files_only=_local,
+    ).state_dict()
 
+    student_sd = model.state_dict()
+    to_load: dict = {}
+    attn_re = re.compile(r'transformer_blocks\.(\d+)\.attn')
 
-def print_model_summary(model: torch.nn.Module, label: str = "") -> None:
-    """Print a per-layer-type parameter count table to stdout."""
-    groups = {
-        "PoM operators":   lambda n: ".pom." in n or ".pom2." in n,
-        "FF LoRA":         lambda n: ".ff_lora_" in n or ".ff_context_lora_" in n,
-        "proj_out LoRA":   lambda n: "proj_out_lora_" in n,
-        "norm_out":        lambda n: "norm_out." in n,
-        "Attention":       lambda n: ".attn." in n,
-        "Feed-forward":    lambda n: ((".ff." in n or ".ff_context." in n)
-                                      and ".ff_lora_" not in n
-                                      and ".ff_context_lora_" not in n),
-        "Block norms":     lambda n: ".norm1" in n or ".norm2" in n,
-        "Embeddings":      lambda n: any(k in n for k in (
-                               "pos_embed", "time_text_embed",
-                               "context_embedder", "patch_embed")),
-        "proj_out (base)": lambda n: "proj_out" in n and "proj_out_lora_" not in n,
-    }
-    totals: dict[str, int] = {g: 0 for g in groups}
-    trainable: dict[str, int] = {g: 0 for g in groups}
-    totals["Other"] = trainable["Other"] = 0
-    for name, param in model.named_parameters():
-        n = param.numel()
-        t = n if param.requires_grad else 0
-        matched = False
-        for g, pred in groups.items():
-            if pred(name):
-                totals[g] += n
-                trainable[g] += t
-                matched = True
-                break
-        if not matched:
-            totals["Other"] += n
-            trainable["Other"] += t
-    all_groups = list(groups) + ["Other"]
-    header = f"Model summary{' — ' + label if label else ''}"
-    print(f"\n{header}")
-    print(f"  {'Layer type':<22}  {'Total':>10}  {'Trainable':>10}")
-    print(f"  {'-'*22}  {'-'*10}  {'-'*10}")
-    for first_trainable in (True, False):
-        for g in all_groups:
-            if (trainable[g] > 0) != first_trainable or totals[g] == 0:
-                continue
-            print(f"  {g:<22}  {totals[g]/1e6:>9.2f}M  {trainable[g]/1e6:>9.2f}M")
-    grand_total = sum(totals.values())
-    grand_trainable = sum(trainable.values())
-    print(f"  {'─'*22}  {'─'*10}  {'─'*10}")
-    print(f"  {'TOTAL':<22}  {grand_total/1e6:>9.2f}M  {grand_trainable/1e6:>9.2f}M\n")
+    for key, val in sd.items():
+        m = re.match(r'transformer_blocks\.(\d+)\.', key)
+        if m:
+            blk = int(m.group(1))
+            if blk not in ATT_KEEP and attn_re.search(key):
+                continue   # PoM block: skip attention weights
+        if key in student_sd and student_sd[key].shape == val.shape:
+            to_load[key] = val
 
+    missing, unexpected = model.load_state_dict(to_load, strict=False)
+    if is_main():
+        pom_missing = [k for k in missing if 'pom' not in k and 'attn' not in k]
+        if pom_missing:
+            print(f"  WARNING: unexpected non-PoM missing keys: {pom_missing[:5]}")
+        n_loaded = sum(v.numel() for k, v in to_load.items())
+        n_total  = sum(p.numel() for p in model.parameters())
+        print(f"  Loaded {n_loaded/1e6:.0f}M / {n_total/1e6:.0f}M params from pretrained.")
 
-def print_model_layers(model: torch.nn.Module) -> None:
-    """Print a per-layer description: block type, trainable params, and role."""
-    from diffusers.models.attention import JointTransformerBlock
-    try:
-        from pom_sd3.blocks import JointPoMBlock, JointLocalAttnBlock
-    except ImportError:
-        JointPoMBlock = JointLocalAttnBlock = None
+    # All params start with requires_grad=True so FSDP gradient hooks are set up
+    # correctly for all blocks. Frozen blocks are excluded from the optimizer
+    # instead — gradients are computed (needed for backprop through frozen layers)
+    # but not applied. Blocks enter the optimizer progressively via activate_block().
 
-    def _tr(mod):
-        return sum(p.numel() for p in mod.parameters() if p.requires_grad)
-
-    cfg = model.config
-    W = 38  # width of the name/type column
-
-    print("Model layers")
-    print(f"  {'Layer':<{W}}  {'Trainable':>10}  Description")
-    print(f"  {'─'*W}  {'─'*10}  {'─'*50}")
-
-    # --- Input layers ---
-    for attr, desc in [
-        ("pos_embed",        f"latent patches → image tokens (patch_size={cfg.patch_size})"),
-        ("time_text_embed",  f"timestep + pooled({cfg.pooled_projection_dim}) → temb({model.inner_dim})"),
-        ("context_embedder", f"text enc({cfg.joint_attention_dim}) → ctx({cfg.caption_projection_dim})"),
-    ]:
-        mod = getattr(model, attr, None)
-        if mod is None:
-            continue
-        name_col = f"{attr}  [{type(mod).__name__}]"
-        t = _tr(mod)
-        print(f"  {name_col:<{W}}  {t/1e6:>9.2f}M  {desc}")
-
-    print(f"  {'─'*W}  {'─'*10}  {'─'*50}")
-
-    # --- Transformer blocks ---
-    for i, blk in enumerate(model.transformer_blocks):
-        bname = type(blk).__name__
-        t = _tr(blk)
-        tr_str = f"{t/1e6:9.2f}M" if t > 0 else "  (frozen)"
-
-        # Mixing description
-        dual = getattr(blk, "use_dual_attention", False)
-        cpo  = getattr(blk, "context_pre_only", False)
-
-        if JointPoMBlock is not None and isinstance(blk, JointPoMBlock):
-            mix = f"joint PoM deg={cfg.pom_degree} exp={cfg.pom_expand}"
-            if dual:
-                mix += " + dual PoM"
-        elif JointLocalAttnBlock is not None and isinstance(blk, JointLocalAttnBlock):
-            mix = f"local attn window={getattr(blk, 'window_m', '?')}"
-            if dual:
-                mix += " + dual local attn"
-        elif isinstance(blk, JointTransformerBlock):
-            mix = "joint full attn"
-            if dual:
-                mix += " + dual attn"
-        else:
-            mix = bname
-
-        ff = "img FF + txt FF" if not cpo else "img FF only"
-        flags = []
-        if dual:
-            flags.append("dual")
-        if cpo:
-            flags.append("ctx-pre-only")
-        flag_str = f"  [{', '.join(flags)}]" if flags else ""
-
-        name_col = f"[{i:2d}] {bname}"
-        print(f"  {name_col:<{W}}  {tr_str:>10}  {mix}, {ff}{flag_str}")
-
-    print(f"  {'─'*W}  {'─'*10}  {'─'*50}")
-
-    # --- Output layers ---
-    for attr, desc in [
-        ("norm_out", "AdaLN output norm conditioned on temb"),
-        ("proj_out", f"Linear({model.inner_dim} → {cfg.patch_size**2 * cfg.out_channels})  unpatchify"),
-    ]:
-        mod = getattr(model, attr, None)
-        if mod is None:
-            continue
-        name_col = f"{attr}  [{type(mod).__name__}]"
-        t = _tr(mod)
-        print(f"  {name_col:<{W}}  {t/1e6:>9.2f}M  {desc}")
-
-    lora_A = getattr(model, "proj_out_lora_A", None)
-    if lora_A is not None:
-        rank = lora_A.out_features
-        t = _tr(lora_A) + _tr(model.proj_out_lora_B)
-        name_col = f"proj_out_lora  [LoRA rank={rank}]"
-        print(f"  {name_col:<{W}}  {t/1e6:>9.2f}M  LoRA on proj_out (merged at end of training)")
-
-    print()
+    return model.to(device)
 
 
 # ---------------------------------------------------------------------------
-# GPic dataset (paired image+caption training)
+# Progressive activation
 # ---------------------------------------------------------------------------
 
-class GPicDataset(torch.utils.data.IterableDataset):
-    """Streams stanford-vision-lab/gpic, preprocesses images, yields (pixel_values, caption).
-
-    Two backends:
-    - Local (dataset_dir set): reads WebDataset tar shards directly from disk.
-      Each tar contains paired <hash>.json + <hash>.jpg/png files.
-      Shards are distributed across ranks by round-robin.
-    - Hub (dataset_dir None): HF datasets streaming from the Hub.
-    """
-
-    def __init__(
-        self,
-        dataset_name: str,
-        split: str,
-        image_size: int,
-        rank: int,
-        world_size: int,
-        caption_type: str | None = None,
-        dataset_dir: str | None = None,
-    ):
-        self._caption_type = caption_type if caption_type != "all" else None
-        self._preprocess = transforms.Compose([
-            transforms.Resize(image_size,
-                              interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.CenterCrop(image_size),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
-        ])
-
-        if dataset_dir:
-            import glob as _glob
-            all_tars = sorted(_glob.glob(os.path.join(dataset_dir, split, "*.tar")))
-            if not all_tars:
-                raise FileNotFoundError(
-                    f"No .tar shards found in {os.path.join(dataset_dir, split)}"
-                )
-            # Distribute shards across DDP ranks (round-robin)
-            self._tar_files = all_tars[rank::world_size]
-            self._ds = None
-        else:
-            from datasets import load_dataset
-            hf_ds = load_dataset(dataset_name, split=split, streaming=True)
-            if world_size > 1:
-                hf_ds = hf_ds.shard(num_shards=world_size, index=rank)
-            self._ds = hf_ds
-            self._tar_files = None
-
-    def __iter__(self):
-        if self._tar_files is not None:
-            import tarfile
-            import json as _json
-            from io import BytesIO
-            from PIL import Image as PILImage
-            for tar_path in self._tar_files:
-                try:
-                    pending: dict = {}
-                    with tarfile.open(tar_path, "r:") as tf:
-                        for member in tf:
-                            if not member.isfile() or "." not in member.name:
-                                continue
-                            base, ext = member.name.rsplit(".", 1)
-                            f = tf.extractfile(member)
-                            if f is None:
-                                continue
-                            data = f.read()
-                            entry = pending.setdefault(base, {})
-                            if ext == "json":
-                                entry["json"] = data
-                            elif ext in ("jpg", "jpeg", "png"):
-                                entry["img"] = data
-                            if "json" in entry and "img" in entry:
-                                del pending[base]
-                                try:
-                                    meta = _json.loads(entry["json"])
-                                    img = PILImage.open(BytesIO(entry["img"])).convert("RGB")
-                                except Exception:
-                                    continue
-                                caption_type = meta.get("caption_type")
-                                caption = meta.get("caption", "")
-                                if self._caption_type and caption_type != self._caption_type:
-                                    continue
-                                if not caption:
-                                    continue
-                                yield {
-                                    "pixel_values": self._preprocess(img),
-                                    "caption": caption,
-                                }
-                except Exception:
-                    continue
-        else:
-            for sample in self._ds:
-                # Hub-streamed: 'image' is a decoded PIL image, metadata is flat
-                try:
-                    img = sample["image"].convert("RGB")
-                except Exception:
-                    continue
-                caption = sample.get("caption", "")
-                if not caption:
-                    continue
-                if self._caption_type and sample.get("caption_type") != self._caption_type:
-                    continue
-                yield {
-                    "pixel_values": self._preprocess(img),
-                    "caption": caption,
-                }
+def block_params(model: torch.nn.Module, block_idx: int) -> list:
+    """Return parameters of transformer_blocks[block_idx] (handles FSDP wrapper)."""
+    inner = getattr(model, '_fsdp_wrapped_module', model)
+    return list(inner.transformer_blocks[block_idx].parameters())
 
 
-def gpic_collate(batch: list[dict]) -> dict:
-    return {
-        "pixel_values": torch.stack([b["pixel_values"] for b in batch]),
-        "caption": [b["caption"] for b in batch],
-    }
+def activate_block(model, optimizer, block_idx: int, lr: float, is_att: bool,
+                   pretrained_lr_scale: float) -> None:
+    """Add one block's params to the optimizer (all params already have requires_grad=True)."""
+    params = block_params(model, block_idx)
+    group_lr = lr * pretrained_lr_scale if is_att else lr
+    optimizer.add_param_group({
+        "params": params,
+        "lr": group_lr,
+        "block_idx": block_idx,
+        "is_att": is_att,
+    })
+    kind = f"att (lr×{pretrained_lr_scale})" if is_att else "PoM"
+    n = sum(p.numel() for p in params)
+    if is_main():
+        print(f"  Activated block {block_idx:2d} ({kind}): {n/1e6:.1f}M params "
+              f"@ lr={group_lr:.2e}")
+
+
+def replay_activations(model, optimizer, phases_done: int, lr: float,
+                       pretrained_lr_scale: float) -> None:
+    """Re-apply activation history when resuming from checkpoint."""
+    for i in range(phases_done):
+        block_idx = ACTIVATION_ORDER[i]
+        is_att = block_idx in ATT_KEEP
+        activate_block(model, optimizer, block_idx, lr, is_att, pretrained_lr_scale)
 
 
 # ---------------------------------------------------------------------------
@@ -361,276 +202,61 @@ def gpic_collate(batch: list[dict]) -> dict:
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model_id", default="stabilityai/stable-diffusion-3.5-medium")
-    p.add_argument("--embeddings_dir", default=None,
-                   help="Pre-computed embedding shards (enc/pooled .npy). "
-                        "Mutually exclusive with --captions_dir and --dataset_name.")
-    p.add_argument("--captions_dir", default=None,
-                   help="Raw caption shards (shard_*.jsonl from download_data.py). "
-                        "Text encoders are run online. Mutually exclusive with --embeddings_dir and --dataset_name.")
-    p.add_argument("--dataset_name", default=None,
-                   help="HF dataset for paired image+caption training (e.g. stanford-vision-lab/gpic). "
-                        "Images are VAE-encoded on-the-fly; teacher is only used when --block_loss_weight > 0. "
-                        "Mutually exclusive with --embeddings_dir / --captions_dir.")
-    p.add_argument("--dataset_dir", default=None,
-                   help="Local directory for the HF dataset (passed as data_dir to load_dataset).")
-    p.add_argument("--dataset_split", default="train")
-    p.add_argument("--caption_type", default="all",
-                   choices=["all", "tag", "short", "medium", "long"],
-                   help="Filter gpic captions by type (default: use all types).")
-    p.add_argument("--image_size", type=int, default=512,
-                   help="Training resolution for gpic images (should match --latent_height/width × 8).")
     p.add_argument("--output_dir", required=True)
-    p.add_argument("--resume", action="store_true",
-                   help="Auto-resume from the latest step_XXXXXXX checkpoint in output_dir "
-                        "(no-op on first run). Put this in the Slurm script so requeueing "
-                        "automatically picks up where training left off.")
-    p.add_argument("--resume_from", default=None,
-                   help="Resume from an explicit checkpoint path (loads model, optimizer, step)")
+    p.add_argument("--resume", action="store_true")
+    p.add_argument("--resume_from", default=None)
+    p.add_argument("--init_from", default=None,
+                   help="Load weights from checkpoint, fresh optimizer/step")
 
-    # PoM arch
+    # Dataset
+    p.add_argument("--dataset_name", default="stanford-vision-lab/gpic")
+    p.add_argument("--dataset_dir", default=None)
+    p.add_argument("--dataset_split", default="train")
+    p.add_argument("--caption_type", default="all")
+    p.add_argument("--image_size", type=int, default=512)
+    p.add_argument("--num_workers", type=int, default=4)
+
+    # PoM architecture
     p.add_argument("--pom_degree", type=int, default=4)
     p.add_argument("--pom_expand", type=int, default=2)
     p.add_argument("--pom_n_groups", type=int, default=1)
     p.add_argument("--pom_n_sel_heads", type=int, default=24)
-    p.add_argument("--pom_rope_max_seq_len", type=int, default=8192,
-                   help="Max sequence length for PoMRoPE frequency tables (N_img + N_txt). "
-                        "8192 covers 512px (1024 patches) and 1024px (4096 patches). "
-                        "Use 32768 for 2048px.")
-    p.add_argument("--lora_rank", type=int, default=16)
+    p.add_argument("--pom_rope_max_seq_len", type=int, default=8192)
 
     # Progressive replacement
-    p.add_argument("--n_pom_blocks_start", type=int, default=1,
-                   help="Number of PoM blocks at initialization (last N blocks of the 24)")
-    p.add_argument("--replacement_step_schedule", type=int, default=1000,
-                   help="Replace one more attention block every this many steps")
+    p.add_argument("--phase_steps", type=int, default=10_000,
+                   help="Training steps between block activations")
+    p.add_argument("--pretrained_lr_scale", type=float, default=0.1,
+                   help="LR multiplier for unfrozen att blocks (smaller = gentler adaptation)")
 
     # Training
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--grad_accum_steps", type=int, default=1)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=1e-2)
-    p.add_argument("--max_steps", type=int, default=30_000)
-    p.add_argument("--warmup_steps", type=int, default=500)
-    p.add_argument("--block_loss_weight", type=float, default=0.1)
-    p.add_argument("--latent_height", type=int, default=64)
-    p.add_argument("--latent_width", type=int, default=64)
-    p.add_argument("--teacher_steps_max", type=int, default=28,
-                   help="Max Euler steps for teacher x_0 generation; scales down at high t")
-    p.add_argument("--amortize_k", type=int, default=2,
-                   help="Independent (t -> x_0 -> x_t) passes per optimizer step")
-    p.add_argument("--uncond_prob", type=float, default=0.1)
+    p.add_argument("--caption_dropout", type=float, default=0.1)
+    p.add_argument("--max_sequence_length", type=int, default=77)
+    p.add_argument("--crop_str_dropout", type=float, default=0.1)
+    p.add_argument("--logit_normal_mean", type=float, default=0.0)
+    p.add_argument("--logit_normal_std", type=float, default=0.8)
+    p.add_argument("--max_steps", type=int, default=500_000)
+    p.add_argument("--warmup_steps", type=int, default=2_000)
+
+    # FSDP
+    p.add_argument("--gpus_per_node", type=int, default=None)
 
     # Logging / checkpointing
-    p.add_argument("--log_every", type=int, default=50)
-    p.add_argument("--save_every", type=int, default=2_000)
-    p.add_argument("--sample_every", type=int, default=2_000)
+    p.add_argument("--log_every", type=int, default=500)
+    p.add_argument("--save_every", type=int, default=10_000)
+    p.add_argument("--sample_every", type=int, default=20_000)
+    p.add_argument("--val_every", type=int, default=10_000)
+    p.add_argument("--n_val_images", type=int, default=256)
     p.add_argument("--num_sample_prompts", type=int, default=25)
-    p.add_argument("--wandb_project", default="sd3-pom")
+    p.add_argument("--wandb_project", default="sd3-pom-progressive")
     p.add_argument("--wandb_run_name", default=None)
     p.add_argument("--wandb_offline", action="store_true")
-    p.add_argument("--smoke_test", action="store_true",
-                   help="Run 5 steps on random data then exit (no HF hub needed)")
+    p.add_argument("--smoke_test", action="store_true")
     return p.parse_args()
-
-
-# ---------------------------------------------------------------------------
-# DDP helpers
-# ---------------------------------------------------------------------------
-
-def is_main() -> bool:
-    return not dist.is_initialized() or dist.get_rank() == 0
-
-
-def setup_ddp():
-    if "RANK" in os.environ:
-        dist.init_process_group("nccl")
-        local_rank = int(os.environ["LOCAL_RANK"])
-        torch.cuda.set_device(local_rank)
-        return local_rank
-    return 0
-
-
-def cleanup_ddp():
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-
-def lr_schedule(step: int, warmup_steps: int, max_steps: int, base_lr: float) -> float:
-    if step < warmup_steps:
-        return base_lr * step / max(1, warmup_steps)
-    progress = (step - warmup_steps) / max(1, max_steps - warmup_steps)
-    return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
-
-
-def find_latest_checkpoint(out_dir: Path) -> Path | None:
-    ckpts = sorted(
-        (p for p in out_dir.glob("step_*") if p.is_dir() and (p / "config.json").exists()),
-        key=lambda p: int(p.name.split("_")[1]),
-    )
-    return ckpts[-1] if ckpts else None
-
-
-def save_checkpoint(model, optimizer, step: int, ckpt_dir: Path) -> None:
-    model.save_pretrained(ckpt_dir)
-    # Keying optimizer state by param name makes it independent of param-group order,
-    # which changes across block replacements (new groups are added incrementally).
-    param_to_name = {id(p): n for n, p in model.named_parameters()}
-    named_state = {
-        param_to_name[id(p)]: {
-            k: v.cpu() if isinstance(v, torch.Tensor) else v
-            for k, v in state.items()
-        }
-        for p, state in optimizer.state.items()
-        if id(p) in param_to_name
-    }
-    torch.save({"named_state": named_state}, ckpt_dir / "optimizer.pt")
-    (ckpt_dir / "train_state.json").write_text(json.dumps({"step": step}))
-
-
-def load_checkpoint_optimizer(opt_data: dict, optimizer, model, device) -> None:
-    """Restore Adam state into optimizer by matching param names, not positions."""
-    named_state = opt_data["named_state"]
-    param_to_name = {id(p): n for n, p in model.named_parameters()}
-    all_params = [p for g in optimizer.param_groups for p in g["params"]]
-
-    new_state: dict = {}
-    for i, p in enumerate(all_params):
-        name = param_to_name.get(id(p))
-        if name and name in named_state:
-            new_state[i] = {
-                k: v.to(device) if isinstance(v, torch.Tensor) else v
-                for k, v in named_state[name].items()
-            }
-
-    pos = 0
-    new_groups = []
-    for g in optimizer.param_groups:
-        ng = {k: v for k, v in g.items() if k != "params"}
-        ng["params"] = list(range(pos, pos + len(g["params"])))
-        new_groups.append(ng)
-        pos += len(g["params"])
-
-    optimizer.load_state_dict({"state": new_state, "param_groups": new_groups})
-
-
-# ---------------------------------------------------------------------------
-# Teacher x_0 generation (shared with train.py)
-# ---------------------------------------------------------------------------
-
-@torch.no_grad()
-def teacher_generate_x0(
-    teacher: SD3Transformer2DModel,
-    scheduler: FlowMatchEulerDiscreteScheduler,
-    enc_hs: torch.Tensor,
-    pooled: torch.Tensor,
-    latent_h: int,
-    latent_w: int,
-    device: torch.device,
-    n_steps: int,
-) -> torch.Tensor:
-    B = enc_hs.shape[0]
-    x = torch.randn(B, 16, latent_h, latent_w, device=device, dtype=torch.bfloat16)
-    scheduler.set_timesteps(n_steps, device=device)
-    for t in scheduler.timesteps:
-        v = teacher(x, enc_hs, pooled, t.expand(B)).sample
-        x = scheduler.step(v, t, x).prev_sample
-    return x
-
-
-# ---------------------------------------------------------------------------
-# Distillation losses (same as train.py)
-# ---------------------------------------------------------------------------
-
-def _mse_mae(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    return F.mse_loss(a, b) + F.l1_loss(a, b)
-
-
-def _mse_mae_block(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    scale = b.detach().std().clamp(min=1e-8)
-    return F.mse_loss(a / scale, b / scale) + F.l1_loss(a / scale, b / scale)
-
-
-def teacher_forced_block_loss(
-    raw_student: PomSD3Transformer2DModel,
-    teacher_block_data: list[dict],
-    device: torch.device,
-) -> torch.Tensor:
-    block_loss = torch.tensor(0.0, device=device)
-    for s_blk, cap in zip(raw_student.transformer_blocks, teacher_block_data):
-        if isinstance(s_blk, JointTransformerBlock):
-            continue  # identical to teacher → zero loss, skip forward pass
-        hs_in = cap.get("hs_in")
-        if hs_in is None:
-            continue
-        enc_hs_pred, hs_pred = s_blk(
-            hidden_states=hs_in,
-            encoder_hidden_states=cap.get("enc_hs_in"),
-            temb=cap["temb_in"],
-        )
-        block_loss = block_loss + _mse_mae_block(hs_pred, cap["hs_out"])
-        if enc_hs_pred is not None and cap.get("enc_hs_out") is not None:
-            block_loss = block_loss + _mse_mae_block(enc_hs_pred, cap["enc_hs_out"])
-    return block_loss
-
-
-# ---------------------------------------------------------------------------
-# Sample generation
-# ---------------------------------------------------------------------------
-
-SAMPLE_PROMPTS = [
-    "a serene mountain landscape at sunrise, photorealistic",
-    "a cyberpunk city at night, neon lights reflecting on wet streets",
-    "a portrait of a fox in a business suit, oil painting",
-    "abstract colorful geometric shapes, vibrant, high contrast",
-    "an astronaut floating in space, Earth visible in the background",
-    "a cozy library with warm lighting and shelves full of books",
-    "a dragon perched on a medieval castle tower, fantasy art",
-    "a bowl of ramen with steam rising, food photography",
-    "a watercolor painting of a Venice canal at dusk",
-    "a robot tending to a flower garden, whimsical illustration",
-    "dense rainforest with rays of sunlight piercing the canopy",
-    "a black and white portrait of an elderly woman, cinematic",
-    "a futuristic space station interior, hard sci-fi concept art",
-    "cherry blossom trees along a river in spring, Japan",
-    "a close-up of a honeybee on a sunflower, macro photography",
-    "a surrealist painting of melting clocks in a desert landscape",
-    "a Viking longship on a stormy sea, dramatic lighting",
-    "a bustling street market in Marrakech, golden hour",
-    "an Art Deco poster of a luxury ocean liner",
-    "a snowy owl in flight against a pale winter sky",
-    "an underwater coral reef teeming with colorful fish",
-    "a steampunk airship over a Victorian city, detailed illustration",
-    "a minimalist ink drawing of a mountain range",
-    "a wolf howling at the full moon in a pine forest, night",
-    "a child blowing dandelion seeds in a summer meadow, soft focus",
-]
-
-
-@torch.no_grad()
-def generate_samples(student, model_id, step, device, num_prompts=4):
-    model_path = Path(model_id)
-    if not (model_path / "vae").exists():
-        print(f"  Skipping samples at step {step}: VAE not found in {model_id}")
-        return
-    print(f"Generating sample images at step {step} ...")
-    pipe = StableDiffusion3Pipeline.from_pretrained(
-        model_id, transformer=None, local_files_only=model_path.exists(),
-    ).to(device=device, dtype=torch.bfloat16)
-    pipe.transformer = student
-    pipe.set_progress_bar_config(disable=True)
-    tmpdir = tempfile.mkdtemp()
-    try:
-        images = []
-        for i, prompt in enumerate(SAMPLE_PROMPTS[:num_prompts]):
-            img = pipe(prompt, num_inference_steps=28, guidance_scale=1.0).images[0]
-            path = os.path.join(tmpdir, f"{i:03d}.jpg")
-            img.save(path, format="JPEG", quality=85)
-            images.append(wandb.Image(path, caption=prompt))
-        del pipe
-        torch.cuda.empty_cache()
-        wandb.log({"samples": images}, step=step)
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -647,8 +273,6 @@ def main():
     out_dir = Path(args.output_dir)
     if is_main():
         out_dir.mkdir(parents=True, exist_ok=True)
-
-    if is_main():
         wandb.init(
             project=args.wandb_project,
             name=args.wandb_run_name,
@@ -657,91 +281,22 @@ def main():
             settings=wandb.Settings(console="off"),
         )
 
-    # --- Validate data source ---
+    # --- Resolve checkpoint paths ---
+    resume_dir: Path | None = None
+    init_dir: Path | None = None
+    if args.resume_from:
+        resume_dir = Path(args.resume_from)
+    elif args.resume:
+        resume_dir = find_latest_checkpoint(out_dir)
+        if resume_dir is None and args.init_from:
+            init_dir = Path(args.init_from)
+    elif args.init_from:
+        init_dir = Path(args.init_from)
+
+    # --- VAE ---
     if not args.smoke_test:
-        sources = sum(bool(x) for x in [args.embeddings_dir, args.captions_dir, args.dataset_name])
-        if sources > 1:
-            raise ValueError("Specify exactly one of --embeddings_dir, --captions_dir, --dataset_name.")
-        if sources == 0:
-            raise ValueError("One of --embeddings_dir, --captions_dir, or --dataset_name is required.")
-
-    # --- Dataset ---
-    if args.smoke_test:
-        if args.dataset_name:
-            # gpic-compatible smoke dataset: yields pixel_values + caption
-            class _SmokeDset(torch.utils.data.IterableDataset):
-                def __iter__(self):
-                    for _ in range(16):
-                        yield {
-                            "pixel_values": torch.randn(3, args.image_size, args.image_size),
-                            "caption": "a test image",
-                        }
-            dataset = _SmokeDset()
-            collate_fn = gpic_collate
-        else:
-            class _SmokeDset(torch.utils.data.Dataset):
-                def __len__(self): return 16
-                def __getitem__(self, i):
-                    return {
-                        "encoder_hidden_states": torch.randn(8, 4096),
-                        "pooled_projections": torch.randn(2048),
-                    }
-            dataset = _SmokeDset()
-            collate_fn = None
-    elif args.captions_dir:
-        dataset = CaptionDataset(args.captions_dir)
-        collate_fn = caption_collate_fn
-    elif args.dataset_name:
-        dataset = GPicDataset(
-            dataset_name=args.dataset_name,
-            split=args.dataset_split,
-            image_size=args.image_size,
-            rank=rank,
-            world_size=world_size,
-            caption_type=args.caption_type,
-            dataset_dir=args.dataset_dir,
-        )
-        collate_fn = gpic_collate
-    else:
-        dataset = EmbeddingDataset(args.embeddings_dir, args.latent_height, args.latent_width)
-        collate_fn = None
-
-    if args.dataset_name:
-        # IterableDataset: sharding is handled internally, no DistributedSampler
-        sampler = None
-        loader = DataLoader(
-            dataset, batch_size=args.batch_size, num_workers=0 if args.smoke_test else 4,
-            pin_memory=not args.smoke_test, collate_fn=collate_fn,
-        )
-    else:
-        sampler = DistributedSampler(dataset, shuffle=True) if dist.is_initialized() else None
-        loader = DataLoader(
-            dataset, batch_size=args.batch_size, sampler=sampler,
-            shuffle=(sampler is None), num_workers=2, pin_memory=True, drop_last=True,
-            collate_fn=collate_fn,
-        )
-
-    # --- Teacher (frozen, for x_0 generation + block-state capture) ---
-    if not args.smoke_test:
-        print(f"[rank {local_rank}] Loading teacher ...")
+        print(f"[rank {rank}] Loading VAE ...")
         _local = Path(args.model_id).exists()
-        teacher = SD3Transformer2DModel.from_pretrained(
-            args.model_id, subfolder="transformer",
-            torch_dtype=torch.bfloat16, local_files_only=_local,
-        ).to(device)
-        teacher.eval()
-        for p in teacher.parameters():
-            p.requires_grad_(False)
-        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            args.model_id, subfolder="scheduler",
-        )
-    else:
-        teacher = None
-        scheduler = None
-
-    # --- VAE (gpic paired-data path) ---
-    if args.dataset_name and not args.smoke_test:
-        print(f"[rank {local_rank}] Loading VAE ...")
         vae = AutoencoderKL.from_pretrained(
             args.model_id, subfolder="vae",
             torch_dtype=torch.bfloat16, local_files_only=_local,
@@ -749,398 +304,374 @@ def main():
         for p in vae.parameters():
             p.requires_grad_(False)
         vae.eval()
+        vae = torch.compile(vae, dynamic=False)
     else:
         vae = None
 
-    # --- Text encoders (online caption encoding path) ---
-    if (args.captions_dir or args.dataset_name) and not args.smoke_test:
-        print(f"[rank {local_rank}] Loading text encoders ...")
-        _local = Path(args.model_id).exists()
+    # --- Text encoders ---
+    if not args.smoke_test:
+        print(f"[rank {rank}] Loading text encoders ...")
         text_pipe = StableDiffusion3Pipeline.from_pretrained(
             args.model_id, transformer=None, vae=None,
-            torch_dtype=torch.bfloat16,
-            local_files_only=_local,
+            torch_dtype=torch.bfloat16, local_files_only=_local,
         ).to(device)
-        for encoder in (text_pipe.text_encoder, text_pipe.text_encoder_2, text_pipe.text_encoder_3):
-            if encoder is not None:
-                encoder.requires_grad_(False)
+        for enc in (text_pipe.text_encoder, text_pipe.text_encoder_2, text_pipe.text_encoder_3):
+            if enc is not None:
+                enc.requires_grad_(False)
+        if text_pipe.text_encoder is not None:
+            text_pipe.text_encoder = torch.compile(text_pipe.text_encoder, dynamic=True)
+        if text_pipe.text_encoder_2 is not None:
+            text_pipe.text_encoder_2 = torch.compile(text_pipe.text_encoder_2, dynamic=True)
+        if text_pipe.text_encoder_3 is not None:
+            text_pipe.text_encoder_3 = torch.compile(text_pipe.text_encoder_3, dynamic=True)
+        if args.caption_dropout > 0:
+            with _silence_encoding_noise():
+                null_enc_hs, null_pooled = fast_encode_prompt(
+                    text_pipe, [""], args.max_sequence_length, device,
+                )
+        else:
+            null_enc_hs = null_pooled = None
     else:
         text_pipe = None
+        null_enc_hs = null_pooled = None
 
-    # --- Resolve resume directory ---
-    resume_dir: Path | None = None
-    if args.resume_from:
-        resume_dir = Path(args.resume_from)
-    elif args.resume:
-        resume_dir = find_latest_checkpoint(out_dir)
-        if resume_dir is None and is_main():
-            print("No checkpoint found in output_dir — starting fresh.")
+    # --- Model ---
+    phases_done = 0   # number of blocks already activated (restored from checkpoint)
 
-    # --- Student (hybrid: attention + PoM) ---
-    num_layers = 24  # SD3.5 Medium; overridden below for smoke test / on resume
     if resume_dir is not None:
-        print(f"[rank {local_rank}] Resuming from {resume_dir} ...")
-        raw_student = PomSD3Transformer2DModel.from_pretrained(resume_dir).to(
-            device=device, dtype=torch.bfloat16
+        print(f"[rank {rank}] Resuming from {resume_dir} ...")
+        model = PomSD3Transformer2DModel.from_pretrained(resume_dir).to(
+            device=device, dtype=torch.bfloat16,
         )
+        state_path = resume_dir / "train_state.json"
+        if state_path.exists():
+            phases_done = json.loads(state_path.read_text()).get("phases_done", 0)
+    elif init_dir is not None:
+        print(f"[rank {rank}] Init weights from {init_dir}, fresh training state ...")
+        model = PomSD3Transformer2DModel.from_pretrained(init_dir).to(
+            device=device, dtype=torch.bfloat16,
+        )
+        state_path = init_dir / "train_state.json"
+        if state_path.exists():
+            phases_done = json.loads(state_path.read_text()).get("phases_done", 0)
     elif not args.smoke_test:
-        print(f"[rank {local_rank}] Building hybrid student ({args.n_pom_blocks_start} PoM blocks) ...")
-        raw_student = build_from_sd3_pretrained(
+        model = build_progressive_model(
             args.model_id,
             pom_degree=args.pom_degree,
             pom_expand=args.pom_expand,
             pom_n_groups=args.pom_n_groups,
             pom_n_sel_heads=args.pom_n_sel_heads,
-            lora_rank=args.lora_rank,
-            n_pom_blocks=args.n_pom_blocks_start,
             pom_rope_max_seq_len=args.pom_rope_max_seq_len,
+            torch_dtype=torch.bfloat16,
             device=device,
         )
     else:
-        raw_student = PomSD3Transformer2DModel(
-            sample_size=32, patch_size=2, in_channels=16, num_layers=4,
+        # Tiny smoke-test model (2 blocks: 1 att + 1 PoM)
+        model = PomSD3Transformer2DModel(
+            sample_size=32, patch_size=2, in_channels=16, num_layers=2,
             attention_head_dim=16, num_attention_heads=4,
             joint_attention_dim=4096, caption_projection_dim=64,
             pooled_projection_dim=2048, out_channels=16,
             pos_embed_max_size=32, dual_attention_layers=(0,),
+            pom_layers=(1,), qk_norm="rms_norm",
             pom_degree=2, pom_expand=2, pom_n_groups=1, pom_n_sel_heads=1,
-            lora_rank=4, n_pom_blocks=args.n_pom_blocks_start,
+            pom_rope_max_seq_len=256, lora_rank=0,
         ).to(device=device, dtype=torch.bfloat16)
+        for p in model.parameters():
+            p.requires_grad_(False)
 
-    num_layers = raw_student.config.num_layers  # correct for both resume and smoke test
-
-    raw_student.train()
-
-    # Freeze attention blocks; only PoM+LoRA params are trainable
-    pom_fragments = (".pom.", ".pom2.", ".ff_lora_", ".ff_context_lora_", "proj_out_lora_", "norm_out.")
-    for name, param in raw_student.named_parameters():
-        param.requires_grad_(any(f in name for f in pom_fragments))
-
-    pom_params = [p for p in raw_student.parameters() if p.requires_grad]
     if is_main():
-        n_trainable = sum(p.numel() for p in pom_params)
-        n_total = sum(p.numel() for p in raw_student.parameters())
-        n_pom_now = raw_student.config.n_pom_blocks or num_layers
-        print_model_summary(raw_student, label=f"{n_pom_now}/{num_layers} PoM blocks")
-        print_model_layers(raw_student)
-        import io as _io
-        _buf = _io.StringIO()
-        _saved = sys.stdout; sys.stdout = _buf
-        print_model_summary(raw_student, label=f"{n_pom_now}/{num_layers} PoM blocks")
-        print_model_layers(raw_student)
-        sys.stdout = _saved
-        wandb.log({"model_structure": wandb.Html(f"<pre>{_buf.getvalue()}</pre>")}, step=0)
+        print_model_summary(model, label="progressive (initially frozen)")
+        print_model_layers(model)
+
+    # FSDP wrap — requires_grad=False params are not reduced (FSDP + use_orig_params=True)
+    model = wrap_model_fsdp(model, local_rank, gpus_per_node=args.gpus_per_node)
+    model.train()
+
+    # --- Optimizer (initially empty; blocks added as they're activated) ---
+    # Overhead params (pos_embed, time_text_embed, context_embedder, norm_out, proj_out)
+    # start trainable — they have no random PoM weights so are safe to train immediately.
+    inner = getattr(model, '_fsdp_wrapped_module', model)
+    block_param_ids = {id(p) for i in range(len(inner.transformer_blocks))
+                       for p in inner.transformer_blocks[i].parameters()}
+    overhead_params = [p for p in model.parameters() if id(p) not in block_param_ids]
+    for p in overhead_params:
+        p.requires_grad_(True)
 
     optimizer = torch.optim.AdamW(
-        pom_params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.999),
+        [{"params": overhead_params, "lr": args.lr * args.pretrained_lr_scale,
+          "block_idx": -1, "is_att": True}],
+        weight_decay=args.weight_decay, betas=(0.9, 0.999),
     )
 
-    # --- Restore optimizer state and step counter ---
+    # Replay activations for resumed runs (adds param groups to optimizer)
+    replay_activations(model, optimizer, phases_done, args.lr, args.pretrained_lr_scale)
+
+    # --- Restore optimizer state on full resume ---
     step = 0
     if resume_dir is not None:
         opt_path = resume_dir / "optimizer.pt"
         if opt_path.exists():
-            load_checkpoint_optimizer(
-                torch.load(opt_path, map_location="cpu"), optimizer, raw_student, device
-            )
-            if is_main():
-                print(f"  Optimizer state restored from {opt_path}")
+            if isinstance(model, FSDP):
+                load_optimizer_fsdp(model, optimizer, resume_dir)
+            else:
+                load_checkpoint_optimizer(
+                    torch.load(opt_path, map_location="cpu"), optimizer, model, device
+                )
         state_path = resume_dir / "train_state.json"
         if state_path.exists():
-            step = json.loads(state_path.read_text())["step"] + 1
+            d = json.loads(state_path.read_text())
+            step = d.get("step", 0) + 1
+            phases_done = d.get("phases_done", phases_done)
             if is_main():
-                print(f"  Resuming at step {step}")
+                print(f"  Resumed at step {step}, phases_done={phases_done}")
+
+    # Activate the first block right away (at step 0) if nothing has been activated yet.
+    # This ensures we have at least one trainable block from the very first step.
+    if phases_done == 0 and not args.smoke_test:
+        block_idx = ACTIVATION_ORDER[0]   # = 23
+        activate_block(model, optimizer, block_idx, args.lr,
+                       is_att=(block_idx in ATT_KEEP), pretrained_lr_scale=args.pretrained_lr_scale)
+        phases_done = 1
+    elif args.smoke_test and phases_done == 0:
+        # smoke: activate both blocks immediately
+        for idx in [1, 0]:
+            activate_block(model, optimizer, idx, args.lr,
+                           is_att=(idx in ATT_KEEP), pretrained_lr_scale=args.pretrained_lr_scale)
+        phases_done = 2
+
+    # --- Dataset ---
+    latent_size = args.image_size // 8
+
+    if args.smoke_test:
+        class _SmokeStream(torch.utils.data.IterableDataset):
+            def __iter__(self):
+                while True:
+                    yield {"pixel_values": torch.randn(3, 64, 64), "caption": "a test image"}
+        dataset = _SmokeStream()
+    else:
+        dataset = GPicDataset(
+            dataset_name=args.dataset_name, split=args.dataset_split,
+            image_size=args.image_size, rank=rank, world_size=world_size,
+            caption_type=args.caption_type, dataset_dir=args.dataset_dir,
+        )
+
+    loader = DataLoader(
+        dataset, batch_size=args.batch_size,
+        num_workers=0 if args.smoke_test else args.num_workers,
+        pin_memory=not args.smoke_test, collate_fn=gpic_collate,
+    )
+
+    # --- Validation cache ---
+    val_cache = None
+    if not args.smoke_test and text_pipe is not None and vae is not None and args.val_every > 0:
+        val_cache = load_val_cache(
+            args.dataset_dir, args.n_val_images, args.image_size,
+            text_pipe, args.max_sequence_length, device, vae,
+        )
 
     # --- Training loop ---
-    epoch = 0
     start_step = step
     t0 = time.time()
+    optimizer.zero_grad(set_to_none=True)
+    batch_iter = iter(loader)
 
     while step < args.max_steps:
-        epoch += 1
-        if sampler is not None:
-            sampler.set_epoch(epoch)
-
-        for batch in loader:
-            if step >= args.max_steps:
-                break
-
-            lr = lr_schedule(step, args.warmup_steps, args.max_steps, args.lr)
-            for pg in optimizer.param_groups:
-                pg["lr"] = lr
-
-            if text_pipe is not None:
-                with torch.no_grad(), _silence_encoding_noise():
-                    prompt_embeds, _, pooled_embeds, _ = text_pipe.encode_prompt(
-                        prompt=batch["caption"],
-                        prompt_2=batch["caption"],
-                        prompt_3=batch["caption"],
-                    )
-                enc_hs = prompt_embeds.to(dtype=torch.bfloat16)
-                pooled = pooled_embeds.to(dtype=torch.bfloat16)
-            else:
-                enc_hs = batch["encoder_hidden_states"].to(device=device, dtype=torch.bfloat16)
-                pooled = batch["pooled_projections"].to(device=device, dtype=torch.bfloat16)
-            B = enc_hs.shape[0]
-
-            # VAE-encode real images once; reuse across all K amortize passes
-            if vae is not None:
-                with torch.no_grad():
-                    latents = vae.encode(
-                        batch["pixel_values"].to(device=device, dtype=torch.bfloat16)
-                    ).latent_dist.sample()
-                    x_0_real = (latents - vae.config.shift_factor) * vae.config.scaling_factor
-            else:
-                x_0_real = None
-
-            if random.random() < args.uncond_prob:
-                enc_hs = torch.zeros_like(enc_hs)
-                pooled = torch.zeros_like(pooled)
-
-            K = args.amortize_k
-            total_loss = torch.tensor(0.0, device=device)
-            final_loss = torch.tensor(0.0, device=device)
-            block_loss = torch.tensor(0.0, device=device)
-            teacher_steps_sum = 0
-
-            for _ in range(K):
-                timestep = torch.randint(1, 999, (B,), device=device)
-
-                # x_0 source: real image latent (gpic) or teacher reverse diffusion
-                if x_0_real is not None:
-                    x_0 = x_0_real
-                elif teacher is not None:
-                    t_frac = 1.0 - timestep.float().mean().item() / 1000.0
-                    #n_steps = max(1, round(args.teacher_steps_max * t_frac))
-                    n_steps = args.teacher_steps_max
-                    teacher_steps_sum += n_steps
-                    x_0 = teacher_generate_x0(
-                        teacher, scheduler, enc_hs, pooled,
-                        args.latent_height, args.latent_width,
-                        device, n_steps=n_steps,
-                    )
-                else:
-                    x_0 = torch.randn(B, 16, 32, 32, device=device, dtype=torch.bfloat16)
-
-                sigma = (timestep.float() / 1000).view(B, 1, 1, 1)
-                eps = torch.randn_like(x_0)
-                x_t = ((1 - sigma) * x_0 + sigma * eps).to(x_0.dtype)
-
-                # Determine first PoM block index (stable within amortize_k loop)
-                n_pom = raw_student.config.n_pom_blocks or num_layers
-                first_pom_idx = num_layers - n_pom
-
-                # Teacher forward — skip entirely when using real images with no block loss.
-                # Hook count otherwise depends on block_loss_weight:
-                #   > 0: all 24 blocks hooked for block distillation
-                #   == 0, first_pom_idx > 0: single post-hook on boundary block only
-                #   == 0, first_pom_idx == 0: no hooks (all blocks are PoM)
-                skip_teacher = (x_0_real is not None) and (args.block_loss_weight == 0)
-                if teacher is not None and not skip_teacher:
-                    teacher_hooks = []
-
-                    if args.block_loss_weight > 0:
-                        teacher_block_data = [{} for _ in range(len(teacher.transformer_blocks))]
-                        for _i, _blk in enumerate(teacher.transformer_blocks):
-                            _cap = teacher_block_data[_i]
-
-                            def _make_pre(_c):
-                                def _hook(_m, _args, _kwargs):
-                                    _c["hs_in"]     = _kwargs.get("hidden_states")
-                                    _c["enc_hs_in"] = _kwargs.get("encoder_hidden_states")
-                                    _c["temb_in"]   = _kwargs.get("temb")
-                                return _hook
-
-                            def _make_post(_c):
-                                def _hook(_m, _inp, _out):
-                                    _c["enc_hs_out"] = _out[0].detach() if _out[0] is not None else None
-                                    _c["hs_out"]     = _out[1].detach()
-                                return _hook
-
-                            teacher_hooks.append(_blk.register_forward_pre_hook(_make_pre(_cap), with_kwargs=True))
-                            teacher_hooks.append(_blk.register_forward_hook(_make_post(_cap)))
-
-                    elif first_pom_idx > 0:
-                        # Only need the boundary state at the attention/PoM transition
-                        teacher_block_data = [None] * len(teacher.transformer_blocks)
-                        _boundary_cap = {}
-                        teacher_block_data[first_pom_idx - 1] = _boundary_cap
-
-                        def _make_boundary_post(_c):
-                            def _hook(_m, _inp, _out):
-                                _c["enc_hs_out"] = _out[0].detach() if _out[0] is not None else None
-                                _c["hs_out"]     = _out[1].detach()
-                            return _hook
-
-                        teacher_hooks.append(
-                            teacher.transformer_blocks[first_pom_idx - 1].register_forward_hook(
-                                _make_boundary_post(_boundary_cap)
-                            )
-                        )
-                    else:
-                        teacher_block_data = []
-
-                    with torch.no_grad():
-                        teacher_out = teacher(
-                            hidden_states=x_t,
-                            encoder_hidden_states=enc_hs,
-                            pooled_projections=pooled,
-                            timestep=timestep,
-                        ).sample.detach()
-
-                    for _h in teacher_hooks:
-                        _h.remove()
-                else:
-                    # smoke test or gpic with block_loss_weight==0 — no teacher needed
-                    teacher_out = None
-                    teacher_block_data = []
-
-                if args.block_loss_weight > 0 and teacher_block_data:
-                    blk_loss_k = teacher_forced_block_loss(raw_student, teacher_block_data, device)
-                else:
-                    blk_loss_k = torch.tensor(0.0, device=device)
-                block_loss = block_loss + blk_loss_k.detach() / K
-
-                # Student final pass: use teacher's captured boundary state so we only
-                # run the PoM blocks (+ norm_out + proj_out_lora) with gradients.
-                # Attention blocks 0..first_pom_idx-1 are frozen and identical to the
-                # teacher, so teacher_block_data already holds their exact output.
-                if first_pom_idx > 0 and teacher_block_data:
-                    _bnd = teacher_block_data[first_pom_idx - 1]
-                    hs_s = _bnd["hs_out"]
-                    enc_hs_s = _bnd["enc_hs_out"]
-                    if args.block_loss_weight > 0:
-                        temb_s = teacher_block_data[0]["temb_in"]
-                    else:
-                        with torch.no_grad():
-                            temb_s = raw_student.time_text_embed(timestep, pooled).detach()
-
-                    for i in range(first_pom_idx, num_layers):
-                        enc_hs_s, hs_s = raw_student.transformer_blocks[i](
-                            hidden_states=hs_s,
-                            encoder_hidden_states=enc_hs_s,
-                            temb=temb_s,
-                        )
-
-                    hs_s = raw_student.norm_out(hs_s, temb_s)
-                    proj_in = hs_s
-                    hs_s = raw_student.proj_out(proj_in)
-                    if getattr(raw_student, "proj_out_lora_A", None) is not None:
-                        hs_s = hs_s + raw_student.proj_out_lora_B(
-                            raw_student.proj_out_lora_A(proj_in)
-                        )
-
-                    ps = raw_student.config.patch_size
-                    hp = args.latent_height // ps
-                    wp = args.latent_width // ps
-                    hs_s = hs_s.reshape(B, hp, wp, ps, ps, raw_student.out_channels)
-                    hs_s = torch.einsum("nhwpqc->nchpwq", hs_s)
-                    student_out = hs_s.reshape(
-                        B, raw_student.out_channels, args.latent_height, args.latent_width
-                    )
-                else:
-                    # All blocks are PoM (late training) or smoke test — full forward
-                    student_out = raw_student(
-                        hidden_states=x_t,
-                        encoder_hidden_states=enc_hs,
-                        pooled_projections=pooled,
-                        timestep=timestep,
-                    ).sample
-
-                if x_0_real is not None:
-                    # gpic mode: flow-matching loss against real VAE target
-                    v_target = (eps - x_0).to(student_out.dtype)
-                    fin_loss_k = _mse_mae(student_out, v_target)
-                else:
-                    fin_loss_k = _mse_mae(student_out, teacher_out)
-                final_loss = final_loss + fin_loss_k.detach() / K
-
-                step_loss = fin_loss_k + args.block_loss_weight * blk_loss_k
-                (step_loss / (K * args.grad_accum_steps)).backward()
-                total_loss = total_loss + step_loss.detach() / K
-
-            if (step + 1) % args.grad_accum_steps == 0:
-                if dist.is_initialized():
-                    world_size = dist.get_world_size()
-                    for _p in pom_params:
-                        if _p.grad is not None:
-                            dist.all_reduce(_p.grad, op=dist.ReduceOp.SUM)
-                            _p.grad.div_(world_size)
-                torch.nn.utils.clip_grad_norm_(pom_params, 1.0)
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-
-            # --- Progressive replacement ---
-            n_pom_now = raw_student.config.n_pom_blocks if raw_student.config.n_pom_blocks is not None else num_layers
-            if step > 0 and step % args.replacement_step_schedule == 0 and n_pom_now < num_layers:
-                new_block = replace_next_attention_block(raw_student)
-                # pom_fragments uses full model-path prefixes (e.g. ".pom.") but
-                # new_block.named_parameters() gives block-relative names ("pom.se_bias"),
-                # so strip the leading dot for matching here.
-                pom_frags_blk = tuple(f.lstrip(".") for f in pom_fragments)
-                new_pom_params = []
-                for name, param in new_block.named_parameters():
-                    is_pom = any(f in name for f in pom_frags_blk)
-                    param.requires_grad_(is_pom)  # freeze norm/ff base, unfreeze pom/lora
-                    if is_pom:
-                        new_pom_params.append(param)
-                        pom_params.append(param)
-                if new_pom_params:
-                    optimizer.add_param_group({"params": new_pom_params})
-                n_pom_now = raw_student.config.n_pom_blocks
-                if is_main():
-                    print(f"  → Replaced block {num_layers - n_pom_now} | "
-                          f"now {n_pom_now}/{num_layers} PoM blocks")
-                    wandb.log({"n_pom_blocks": n_pom_now}, step=step)
-
-            # --- Logging ---
-            if is_main() and step % args.log_every == 0:
-                elapsed = time.time() - t0
-                n_world = dist.get_world_size() if dist.is_initialized() else 1
-                log = {
-                    "loss": total_loss.item(),
-                    "final_loss": final_loss.item(),
-                    "block_loss": block_loss.item(),
-                    "teacher_steps_avg": teacher_steps_sum / K if teacher_steps_sum > 0 else 0,
-                    "n_pom_blocks": n_pom_now,
-                    "lr": lr,
-                    "step": step,
-                    "samples_per_sec": (step + 1 - start_step) * args.batch_size * n_world / elapsed,
-                }
-                wandb.log(log, step=step)
-                print(
-                    f"step={step:6d}  loss={log['loss']:.4f}  "
-                    f"final={log['final_loss']:.4f}  block={log['block_loss']:.4f}  "
-                    f"pom={n_pom_now}/{num_layers}  lr={lr:.2e}  {log['samples_per_sec']:.1f} samp/s"
+        # --- Progressive activation ---
+        # At each phase boundary (after the first, which happened before the loop),
+        # activate the next block from ACTIVATION_ORDER.
+        if (step > 0 and step % args.phase_steps == 0
+                and phases_done < len(ACTIVATION_ORDER) and not args.smoke_test):
+            block_idx = ACTIVATION_ORDER[phases_done]
+            activate_block(model, optimizer, block_idx, args.lr,
+                           is_att=(block_idx in ATT_KEEP),
+                           pretrained_lr_scale=args.pretrained_lr_scale)
+            phases_done += 1
+            if is_main():
+                total_trainable = sum(
+                    p.numel() for g in optimizer.param_groups for p in g["params"]
+                    if p.requires_grad
                 )
+                print(f"step={step}  phases_done={phases_done}/{len(ACTIVATION_ORDER)}"
+                      f"  trainable={total_trainable/1e6:.0f}M params")
 
-            # --- Checkpointing ---
-            if is_main() and step > 0 and step % args.save_every == 0:
-                ckpt_dir = out_dir / f"step_{step:07d}"
-                save_checkpoint(raw_student, optimizer, step, ckpt_dir)
+        # --- LR schedule ---
+        lr = lr_schedule(step, args.warmup_steps, args.max_steps, args.lr)
+        for pg in optimizer.param_groups:
+            scale = args.pretrained_lr_scale if pg.get("is_att", False) else 1.0
+            pg["lr"] = lr * scale
+
+        # --- Batch ---
+        try:
+            batch = next(batch_iter)
+        except StopIteration:
+            batch_iter = iter(loader)
+            batch = next(batch_iter)
+
+        pixel_values = batch["pixel_values"]
+        captions = batch["caption"]
+        B = pixel_values.shape[0]
+
+        crop_strs = batch.get("crop_str")
+        if crop_strs is not None and args.crop_str_dropout < 1.0:
+            captions = [
+                cap + " " + cs if random.random() > args.crop_str_dropout else cap
+                for cap, cs in zip(captions, crop_strs)
+            ]
+
+        # --- VAE encode ---
+        if vae is not None:
+            with torch.no_grad():
+                latents = vae.encode(
+                    pixel_values.to(device=device, dtype=torch.bfloat16)
+                ).latent_dist.sample()
+                x_0 = (latents - vae.config.shift_factor) * vae.config.scaling_factor
+        else:
+            x_0 = torch.randn(B, 16, latent_size, latent_size,
+                               device=device, dtype=torch.bfloat16)
+
+        # --- Text encode ---
+        if text_pipe is not None:
+            with _silence_encoding_noise():
+                enc_hs, pooled = fast_encode_prompt(
+                    text_pipe, captions, args.max_sequence_length, device,
+                )
+            if args.caption_dropout > 0 and null_enc_hs is not None:
+                drop = torch.rand(B, device=device) < args.caption_dropout
+                if drop.any():
+                    n_drop = int(drop.sum())
+                    enc_hs[drop] = null_enc_hs.expand(n_drop, -1, -1)
+                    pooled[drop] = null_pooled.expand(n_drop, -1)
+        else:
+            enc_hs = torch.randn(B, 8, 4096, device=device, dtype=torch.bfloat16)
+            pooled = torch.randn(B, 2048, device=device, dtype=torch.bfloat16)
+
+        # --- Flow matching loss (SD3 v-prediction) ---
+        u = torch.sigmoid(
+            torch.randn(B, device=device) * args.logit_normal_std + args.logit_normal_mean
+        )
+        t = (u * 999).clamp(1, 999).long()
+        sigma = (t.float() / 1000).view(B, 1, 1, 1)
+        eps = torch.randn_like(x_0)
+        x_t = ((1 - sigma) * x_0 + sigma * eps).to(x_0.dtype)
+
+        is_last_accum = (step + 1) % args.grad_accum_steps == 0
+        sync_ctx = (
+            contextlib.nullcontext()
+            if not isinstance(model, FSDP) or is_last_accum
+            else model.no_sync()
+        )
+        with sync_ctx:
+            v_pred = model(
+                hidden_states=x_t,
+                encoder_hidden_states=enc_hs,
+                pooled_projections=pooled,
+                timestep=t,
+            ).sample
+            v_target = (eps - x_0).to(v_pred.dtype)
+            loss_per = F.mse_loss(v_pred, v_target, reduction="none").mean(dim=(1, 2, 3))
+            loss = loss_per.mean()
+            (loss / args.grad_accum_steps).backward()
+
+        if is_last_accum:
+            if isinstance(model, FSDP):
+                model.clip_grad_norm_(1.0)
+            else:
+                torch.nn.utils.clip_grad_norm_(
+                    [p for g in optimizer.param_groups for p in g["params"]], 1.0
+                )
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+        # --- Logging ---
+        if is_main() and step % args.log_every == 0:
+            elapsed = time.time() - t0
+            sps = (step + 1 - start_step) * args.batch_size * world_size / elapsed
+            t_cpu = t.cpu().float()
+            lp = loss_per.detach().cpu()
+            low  = t_cpu < 334
+            mid  = (t_cpu >= 334) & (t_cpu < 667)
+            high = t_cpu >= 667
+            log = {
+                "loss":        loss.item(),
+                "loss_low_t":  lp[low].mean().item()  if low.any()  else float("nan"),
+                "loss_mid_t":  lp[mid].mean().item()  if mid.any()  else float("nan"),
+                "loss_high_t": lp[high].mean().item() if high.any() else float("nan"),
+                "lr": lr,
+                "phases_done": phases_done,
+                "step": step,
+                "samples_per_sec": sps,
+            }
+            wandb.log(log, step=step)
+            print(f"step={step:7d}  loss={log['loss']:.4f}  lr={lr:.2e}"
+                  f"  phases={phases_done}/{len(ACTIVATION_ORDER)}  {sps:.1f} samp/s")
+
+        # --- Checkpointing ---
+        if step > 0 and step % args.save_every == 0:
+            ckpt_dir = out_dir / f"step_{step:07d}"
+            save_checkpoint(model, optimizer, step, ckpt_dir)
+            # Append phases_done to the train_state so resume restores correctly
+            if is_main():
+                state = json.loads((ckpt_dir / "train_state.json").read_text())
+                state["phases_done"] = phases_done
+                (ckpt_dir / "train_state.json").write_text(json.dumps(state))
                 print(f"Saved checkpoint to {ckpt_dir}")
+            if dist.is_initialized():
+                dist.barrier()
 
-            # --- Image samples ---
-            if is_main() and step > 0 and step % args.sample_every == 0 and not args.smoke_test:
-                raw_student.eval()
-                generate_samples(raw_student, args.model_id, step, device, args.num_sample_prompts)
-                raw_student.train()
+        # --- Validation ---
+        if step > 0 and args.val_every > 0 and step % args.val_every == 0 and not args.smoke_test:
+            run_validation(model, val_cache, step, device)
 
-            step += 1
+        # --- Sample generation ---
+        if step > 0 and step % args.sample_every == 0 and not args.smoke_test:
+            model.eval()
+            generate_samples(model, vae, text_pipe, step, device,
+                             args.num_sample_prompts, resolution=args.image_size)
+            model.train()
 
-            if args.smoke_test and step >= 5:
-                print("Smoke test passed — 5 steps completed successfully.")
-                cleanup_ddp()
-                return
+        step += 1
+
+        # --- Wall-time signal (Slurm requeue) ---
+        if (out_dir / ".save_and_exit").exists():
+            ckpt_dir = out_dir / f"step_{step:07d}"
+            save_checkpoint(model, optimizer, step, ckpt_dir)
+            if is_main():
+                state = json.loads((ckpt_dir / "train_state.json").read_text())
+                state["phases_done"] = phases_done
+                (ckpt_dir / "train_state.json").write_text(json.dumps(state))
+                (out_dir / ".save_and_exit").unlink(missing_ok=True)
+                print(f"Wall-time signal — saved to {ckpt_dir}. Exiting.")
+            cleanup_ddp()
+            sys.exit(0)
+
+        if args.smoke_test and step >= 5:
+            print("Smoke test passed.")
+            cleanup_ddp()
+            return
 
     # --- Final save ---
-    if is_main():
-        raw_student.merge_lora()
-        final_dir = out_dir / "final"
-        raw_student.save_pretrained(final_dir)
-        print(f"Training complete. Final model (LoRA merged) saved to {final_dir}")
-        wandb.finish()
+    final_dir = out_dir / "final"
+    if isinstance(model, FSDP):
+        fsdp_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, fsdp_cfg):
+            full_sd = model.state_dict()
+        _prefix = "_fsdp_wrapped_module."
+        full_sd = {(k[len(_prefix):] if k.startswith(_prefix) else k): v
+                   for k, v in full_sd.items()}
+        if is_main():
+            final_dir.mkdir(parents=True, exist_ok=True)
+            safetensors_save_file(full_sd, final_dir / "diffusion_pytorch_model.safetensors")
+            getattr(model, "_fsdp_wrapped_module", model).save_config(final_dir)
+        if dist.is_initialized():
+            dist.barrier()
+    else:
+        if is_main():
+            model.save_pretrained(final_dir)
 
+    if is_main():
+        print(f"Training complete. Model saved to {final_dir}")
+        wandb.finish()
     cleanup_ddp()
 
 
