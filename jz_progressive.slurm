@@ -64,8 +64,8 @@ srun torchrun \
         --pom_n_sel_heads 24 \
         --phase_steps 10000 \
         --pretrained_lr_scale 0.1 \
-        --batch_size 32 \
-        --grad_accum_steps 4 \
+        --batch_size 16 \
+        --grad_accum_steps 8 \
         --lr 1e-4 \
         --warmup_steps 2000 \
         --logit_normal_mean 0.0 \
