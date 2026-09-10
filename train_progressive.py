@@ -486,6 +486,14 @@ def main():
         # activate the next block from ACTIVATION_ORDER.
         if (step > 0 and step % args.phase_steps == 0
                 and phases_done < len(ACTIVATION_ORDER) and not args.smoke_test):
+            # Log samples just before replacing the next block so we have a
+            # clean baseline uncontaminated by the freshly activated block.
+            # Logged at step-1 so it appears just before the phase boundary in wandb.
+            model.eval()
+            generate_samples(model, vae, text_pipe, step - 1, device,
+                             args.num_sample_prompts, resolution=args.image_size)
+            model.train()
+
             block_idx = ACTIVATION_ORDER[phases_done]
             activate_block(model, optimizer, block_idx, args.lr,
                            is_att=(block_idx in ATT_KEEP),
