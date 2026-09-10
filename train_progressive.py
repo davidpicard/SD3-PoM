@@ -704,6 +704,14 @@ def main():
 
         # --- Update loss EMA and history (used for plateau detection) ---
         loss_val = loss.item()
+        # All-reduce the scalar loss so every rank has the same EMA value.
+        # Plateau detection uses loss_history; if ranks diverge they advance
+        # the phase at different steps → NCCL deadlock on the FSDP forward
+        # inside generate_samples.
+        if dist.is_initialized():
+            _lv = torch.tensor(loss_val, device=device)
+            dist.all_reduce(_lv, op=dist.ReduceOp.AVG)
+            loss_val = _lv.item()
         if loss_ema is None:
             loss_ema = loss_val
         else:
