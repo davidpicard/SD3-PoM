@@ -14,7 +14,7 @@ from diffusers.models.normalization import (
     SD35AdaLayerNormZeroX,
 )
 from diffusers.utils.torch_utils import maybe_allow_in_graph
-from pom.pom_rope import PoMRoPE
+from .pom.pom_rope import PoMRoPE
 
 from .masks import build_joint_mask
 

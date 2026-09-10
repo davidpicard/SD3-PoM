@@ -58,7 +58,7 @@ srun torchrun \
         --caption_type all \
         --caption_dropout 0.1 \
         --image_size 512 \
-        --pom_degree 4 \
+        --pom_degree 10 \
         --pom_expand 2 \
         --pom_n_groups 1 \
         --pom_n_sel_heads 24 \
