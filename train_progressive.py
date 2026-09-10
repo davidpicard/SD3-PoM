@@ -770,11 +770,15 @@ def main():
                 _block_gnorms = _group_grad_norms()
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
-            # EMA update: lerp each shard toward the current weights
+            # EMA update: lerp each shard toward the current weights.
+            # Adaptive decay ramps from ~0 at step 0 to args.ema_decay
+            # asymptotically, so early samples aren't biased toward the
+            # randomly-initialised PoM weights.
             if ema_params is not None:
+                ema_decay_t = min(args.ema_decay, (1.0 + step) / (10.0 + step))
                 with torch.no_grad():
                     for ema_p, p in zip(ema_params, model.parameters()):
-                        ema_p.lerp_(p.data.float(), 1.0 - args.ema_decay)
+                        ema_p.lerp_(p.data.float(), 1.0 - ema_decay_t)
 
         # --- Update loss EMA and history (used for plateau detection) ---
         loss_val = loss.item()
