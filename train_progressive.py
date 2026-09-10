@@ -510,10 +510,26 @@ def main():
             model.train()
 
             block_idx = ACTIVATION_ORDER[phases_done]
+            is_att_block = block_idx in ATT_KEEP
             activate_block(model, optimizer, block_idx, args.lr,
-                           is_att=(block_idx in ATT_KEEP),
+                           is_att=is_att_block,
                            pretrained_lr_scale=args.pretrained_lr_scale)
             phases_done += 1
+
+            # When inserting a PoM block at position k, every downstream block
+            # (block_idx > k) now receives a changed activation distribution.
+            # Att blocks among them were frozen at pretrained_lr_scale to gently
+            # awaken; but the upstream PoM invalidates their pretrained input
+            # statistics, so bump them to full LR now.
+            if not is_att_block:
+                for pg in optimizer.param_groups:
+                    bid = pg.get("block_idx", -1)
+                    if bid >= 0 and bid > block_idx and pg.get("is_att", False):
+                        pg["is_att"] = False
+                        if is_main():
+                            print(f"  Bumped block {bid} to full LR "
+                                  f"(upstream PoM inserted at block {block_idx})")
+
             if is_main():
                 total_trainable = sum(
                     p.numel() for g in optimizer.param_groups for p in g["params"]
