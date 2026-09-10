@@ -523,6 +523,19 @@ def main():
             if is_main():
                 print(f"  Resumed at step {step}, phases_done={phases_done}")
 
+    # --- Load EMA state if resuming ---
+    if ema_params is not None and resume_dir is not None:
+        ema_path = resume_dir / f"ema_rank{rank}.pt"
+        if ema_path.exists():
+            saved_ema = torch.load(ema_path, map_location="cpu", weights_only=True)
+            for ema_p, sv in zip(ema_params, saved_ema):
+                ema_p.copy_(sv.float())
+            if is_main():
+                print(f"  Loaded EMA from {ema_path.name}")
+        else:
+            if is_main():
+                print("  No EMA checkpoint found — EMA initialised from model weights")
+
     # Activate the first block right away (at step 0) if nothing has been activated yet.
     # This ensures we have at least one trainable block from the very first step.
     if phases_done == 0 and not args.smoke_test:
@@ -822,6 +835,8 @@ def main():
                 state["last_phase_step"] = last_phase_step
                 (ckpt_dir / "train_state.json").write_text(json.dumps(state))
                 print(f"Saved checkpoint to {ckpt_dir}")
+            if ema_params is not None:
+                torch.save([p.cpu() for p in ema_params], ckpt_dir / f"ema_rank{rank}.pt")
             if dist.is_initialized():
                 dist.barrier()
 
@@ -844,6 +859,8 @@ def main():
         if (out_dir / ".save_and_exit").exists():
             ckpt_dir = out_dir / f"step_{step:07d}"
             save_checkpoint(model, optimizer, step, ckpt_dir)
+            if ema_params is not None:
+                torch.save([p.cpu() for p in ema_params], ckpt_dir / f"ema_rank{rank}.pt")
             if is_main():
                 state = json.loads((ckpt_dir / "train_state.json").read_text())
                 state["phases_done"] = phases_done
@@ -851,6 +868,8 @@ def main():
                 (ckpt_dir / "train_state.json").write_text(json.dumps(state))
                 (out_dir / ".save_and_exit").unlink(missing_ok=True)
                 print(f"Wall-time signal — saved to {ckpt_dir}. Exiting.")
+            if dist.is_initialized():
+                dist.barrier()
             cleanup_ddp()
             sys.exit(0)
 
@@ -877,6 +896,9 @@ def main():
     else:
         if is_main():
             model.save_pretrained(final_dir)
+
+    if ema_params is not None:
+        torch.save([p.cpu() for p in ema_params], final_dir / f"ema_rank{rank}.pt")
 
     if is_main():
         print(f"Training complete. Model saved to {final_dir}")
