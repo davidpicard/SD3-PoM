@@ -393,18 +393,33 @@ def main():
     model.train()
 
     # --- Optimizer (initially empty; blocks added as they're activated) ---
-    # Overhead params (pos_embed, time_text_embed, context_embedder, norm_out, proj_out)
-    # start trainable — they have no random PoM weights so are safe to train immediately.
+    # Overhead params are split into two groups:
+    #   input-side  (pos_embed, time_text_embed, context_embedder): pretrained weights worth
+    #               preserving → pretrained_lr_scale × lr
+    #   output-side (norm_out, proj_out): pretrained only for SD3.5 att block outputs, so
+    #               their pretrained calibration becomes meaningless as PoM blocks take over;
+    #               train at full lr so they can adapt quickly.
     inner = getattr(model, '_fsdp_wrapped_module', model)
     block_param_ids = {id(p) for i in range(len(inner.transformer_blocks))
                        for p in inner.transformer_blocks[i].parameters()}
-    overhead_params = [p for p in model.parameters() if id(p) not in block_param_ids]
-    for p in overhead_params:
+
+    output_modules = (inner.norm_out, inner.proj_out)
+    output_param_ids = {id(p) for m in output_modules for p in m.parameters()}
+
+    input_overhead  = [p for p in model.parameters()
+                       if id(p) not in block_param_ids and id(p) not in output_param_ids]
+    output_overhead = [p for p in model.parameters() if id(p) in output_param_ids]
+
+    for p in input_overhead + output_overhead:
         p.requires_grad_(True)
 
     optimizer = torch.optim.AdamW(
-        [{"params": overhead_params, "lr": args.lr * args.pretrained_lr_scale,
-          "block_idx": -1, "is_att": True}],
+        [
+            {"params": input_overhead,  "lr": args.lr * args.pretrained_lr_scale,
+             "block_idx": -1, "is_att": True},
+            {"params": output_overhead, "lr": args.lr,
+             "block_idx": -2, "is_att": False},
+        ],
         weight_decay=args.weight_decay, betas=(0.9, 0.999),
     )
 
