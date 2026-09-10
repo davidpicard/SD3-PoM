@@ -14,6 +14,7 @@ Launch:
     torchrun --nproc_per_node=4 --nnodes=2 ... train_progressive.py ...
 """
 import argparse
+import collections
 import contextlib
 import functools
 import json
@@ -150,10 +151,20 @@ def build_progressive_model(
         n_total  = sum(p.numel() for p in model.parameters())
         print(f"  Loaded {n_loaded/1e6:.0f}M / {n_total/1e6:.0f}M params from pretrained.")
 
-    # All params start with requires_grad=True so FSDP gradient hooks are set up
-    # correctly for all blocks. Frozen blocks are excluded from the optimizer
-    # instead — gradients are computed (needed for backprop through frozen layers)
-    # but not applied. Blocks enter the optimizer progressively via activate_block().
+    # AdaLN-Zero for all PoM blocks: zero norm1/norm1_context linear projections
+    # so each block starts as an identity map (gate=0 → zero residual contribution).
+    # Frozen blocks receive no optimizer updates, so their gates stay near-zero until
+    # activated. This eliminates the random-signal spike that otherwise corrupts the
+    # residual stream when a new block first enters the optimizer.
+    import torch.nn as nn
+    for i, blk in enumerate(model.transformer_blocks):
+        if i not in ATT_KEEP:
+            for attr in ("norm1", "norm1_context"):
+                norm = getattr(blk, attr, None)
+                if norm is not None and hasattr(norm, "linear"):
+                    nn.init.zeros_(norm.linear.weight)
+                    if norm.linear.bias is not None:
+                        nn.init.zeros_(norm.linear.bias)
 
     return model.to(device)
 
@@ -169,7 +180,7 @@ def block_params(model: torch.nn.Module, block_idx: int) -> list:
 
 
 def activate_block(model, optimizer, block_idx: int, lr: float, is_att: bool,
-                   pretrained_lr_scale: float) -> None:
+                   pretrained_lr_scale: float, activated_at: int = 0) -> None:
     """Add one block's params to the optimizer (all params already have requires_grad=True)."""
     params = block_params(model, block_idx)
     group_lr = lr * pretrained_lr_scale if is_att else lr
@@ -178,6 +189,7 @@ def activate_block(model, optimizer, block_idx: int, lr: float, is_att: bool,
         "lr": group_lr,
         "block_idx": block_idx,
         "is_att": is_att,
+        "activated_at": activated_at,
     })
     kind = f"att (lr×{pretrained_lr_scale})" if is_att else "PoM"
     n = sum(p.numel() for p in params)
@@ -187,12 +199,20 @@ def activate_block(model, optimizer, block_idx: int, lr: float, is_att: bool,
 
 
 def replay_activations(model, optimizer, phases_done: int, lr: float,
-                       pretrained_lr_scale: float) -> None:
-    """Re-apply activation history when resuming from checkpoint."""
+                       pretrained_lr_scale: float, phase_steps: int = 0) -> None:
+    """Re-apply activation history when resuming from checkpoint.
+
+    On resume we don't know exact activation times, so set activated_at so that
+    the per-block warmup is already fully ramped (use negative offsets).
+    """
     for i in range(phases_done):
         block_idx = ACTIVATION_ORDER[i]
         is_att = block_idx in ATT_KEEP
-        activate_block(model, optimizer, block_idx, lr, is_att, pretrained_lr_scale)
+        # Estimate each block was activated at i * phase_steps; mark fully warmed
+        # by setting activated_at far in the past relative to current step.
+        estimated_at = i * phase_steps
+        activate_block(model, optimizer, block_idx, lr, is_att, pretrained_lr_scale,
+                       activated_at=estimated_at)
 
 
 # ---------------------------------------------------------------------------
@@ -225,9 +245,20 @@ def parse_args():
 
     # Progressive replacement
     p.add_argument("--phase_steps", type=int, default=10_000,
-                   help="Training steps between block activations")
+                   help="Maximum steps per phase; also used as minimum when plateau detection fires")
     p.add_argument("--pretrained_lr_scale", type=float, default=0.1,
                    help="LR multiplier for unfrozen att blocks (smaller = gentler adaptation)")
+    p.add_argument("--block_warmup_steps", type=int, default=1_000,
+                   help="Per-block LR warmup steps after activation (ramps 0→full LR)")
+    p.add_argument("--min_phase_steps", type=int, default=None,
+                   help="Minimum steps before plateau check triggers early phase advance "
+                        "(default: phase_steps // 2)")
+    p.add_argument("--plateau_threshold", type=float, default=0.005,
+                   help="Relative loss improvement below which a phase is considered converged")
+    p.add_argument("--plateau_window", type=int, default=2_000,
+                   help="Steps over which to measure loss improvement for plateau detection")
+    p.add_argument("--consolidation_lr_scale", type=float, default=0.5,
+                   help="LR multiplier applied to ALL groups once all blocks are activated")
 
     # Training
     p.add_argument("--batch_size", type=int, default=4)
@@ -285,6 +316,7 @@ def main():
     # --- Resolve checkpoint paths ---
     resume_dir: Path | None = None
     init_dir: Path | None = None
+    _resume_last_phase_step: int = 0
     if args.resume_from:
         resume_dir = Path(args.resume_from)
     elif args.resume:
@@ -416,15 +448,16 @@ def main():
     optimizer = torch.optim.AdamW(
         [
             {"params": input_overhead,  "lr": args.lr * args.pretrained_lr_scale,
-             "block_idx": -1, "is_att": True},
+             "block_idx": -1, "is_att": True,  "activated_at": 0},
             {"params": output_overhead, "lr": args.lr,
-             "block_idx": -2, "is_att": False},
+             "block_idx": -2, "is_att": False, "activated_at": 0},
         ],
         weight_decay=args.weight_decay, betas=(0.9, 0.999),
     )
 
     # Replay activations for resumed runs (adds param groups to optimizer)
-    replay_activations(model, optimizer, phases_done, args.lr, args.pretrained_lr_scale)
+    replay_activations(model, optimizer, phases_done, args.lr, args.pretrained_lr_scale,
+                       phase_steps=args.phase_steps)
 
     # --- Restore optimizer state on full resume ---
     step = 0
@@ -438,10 +471,12 @@ def main():
                     torch.load(opt_path, map_location="cpu"), optimizer, model, device
                 )
         state_path = resume_dir / "train_state.json"
+        _resume_last_phase_step = step
         if state_path.exists():
             d = json.loads(state_path.read_text())
             step = d.get("step", 0) + 1
             phases_done = d.get("phases_done", phases_done)
+            _resume_last_phase_step = d.get("last_phase_step", 0)
             if is_main():
                 print(f"  Resumed at step {step}, phases_done={phases_done}")
 
@@ -450,7 +485,8 @@ def main():
     if phases_done == 0 and not args.smoke_test:
         block_idx = ACTIVATION_ORDER[0]   # = 23
         activate_block(model, optimizer, block_idx, args.lr,
-                       is_att=(block_idx in ATT_KEEP), pretrained_lr_scale=args.pretrained_lr_scale)
+                       is_att=(block_idx in ATT_KEEP), pretrained_lr_scale=args.pretrained_lr_scale,
+                       activated_at=0)
         phases_done = 1
     elif args.smoke_test and phases_done == 0:
         # smoke: activate both blocks immediately
@@ -489,60 +525,100 @@ def main():
             text_pipe, args.max_sequence_length, device, vae,
         )
 
-    # --- Training loop ---
+    # --- Training loop setup ---
+    min_phase_steps = args.min_phase_steps if args.min_phase_steps is not None \
+                      else args.phase_steps // 2
+    last_phase_step = _resume_last_phase_step if resume_dir is not None else step
+    loss_ema = None                 # exponential moving average of the loss
+    loss_ema_decay = 0.99
+    loss_history = collections.deque(maxlen=args.plateau_window)  # for plateau detection
+    in_consolidation = (phases_done == len(ACTIVATION_ORDER))
+
     start_step = step
     t0 = time.time()
     optimizer.zero_grad(set_to_none=True)
     batch_iter = iter(loader)
 
-    while step < args.max_steps:
-        # --- Progressive activation ---
-        # At each phase boundary (after the first, which happened before the loop),
-        # activate the next block from ACTIVATION_ORDER.
-        if (step > 0 and step % args.phase_steps == 0
-                and phases_done < len(ACTIVATION_ORDER) and not args.smoke_test):
-            # Log samples just before replacing the next block so we have a
-            # clean baseline uncontaminated by the freshly activated block.
-            # Logged at step-1 so it appears just before the phase boundary in wandb.
-            model.eval()
-            generate_samples(model, vae, text_pipe, step - 1, device,
-                             args.num_sample_prompts, resolution=args.image_size)
-            model.train()
+    def _try_advance_phase(step):
+        """Activate the next block if the phase has converged or hit phase_steps."""
+        nonlocal phases_done, last_phase_step, loss_ema, in_consolidation
+        if phases_done >= len(ACTIVATION_ORDER) or args.smoke_test:
+            return
+        steps_in_phase = step - last_phase_step
+        if steps_in_phase < min_phase_steps:
+            return
 
-            block_idx = ACTIVATION_ORDER[phases_done]
-            is_att_block = block_idx in ATT_KEEP
-            activate_block(model, optimizer, block_idx, args.lr,
-                           is_att=is_att_block,
-                           pretrained_lr_scale=args.pretrained_lr_scale)
-            phases_done += 1
+        # Check: hit hard cap OR loss has plateaued.
+        plateau = False
+        if len(loss_history) == args.plateau_window:
+            old_ema = loss_history[0]
+            cur_ema = loss_history[-1]
+            relative_improvement = (old_ema - cur_ema) / (old_ema + 1e-8)
+            plateau = relative_improvement < args.plateau_threshold
+        forced = steps_in_phase >= args.phase_steps
 
-            # When inserting a PoM block at position k, every downstream block
-            # (block_idx > k) now receives a changed activation distribution.
-            # Att blocks among them were frozen at pretrained_lr_scale to gently
-            # awaken; but the upstream PoM invalidates their pretrained input
-            # statistics, so bump them to full LR now.
-            if not is_att_block:
-                for pg in optimizer.param_groups:
-                    bid = pg.get("block_idx", -1)
-                    if bid >= 0 and bid > block_idx and pg.get("is_att", False):
-                        pg["is_att"] = False
-                        if is_main():
-                            print(f"  Bumped block {bid} to full LR "
-                                  f"(upstream PoM inserted at block {block_idx})")
+        if not (plateau or forced):
+            return
 
+        reason = "plateau" if plateau and not forced else "max steps"
+
+        # Log samples just before activating the next block — clean baseline
+        # uncontaminated by the freshly activated block (logged at step-1).
+        model.eval()
+        generate_samples(model, vae, text_pipe, step - 1, device,
+                         args.num_sample_prompts, resolution=args.image_size)
+        model.train()
+
+        block_idx = ACTIVATION_ORDER[phases_done]
+        is_att_block = block_idx in ATT_KEEP
+        activate_block(model, optimizer, block_idx, args.lr,
+                       is_att=is_att_block,
+                       pretrained_lr_scale=args.pretrained_lr_scale,
+                       activated_at=step)
+        phases_done += 1
+        last_phase_step = step
+
+        # Bump downstream att blocks to full LR when a PoM is inserted upstream.
+        if not is_att_block:
+            for pg in optimizer.param_groups:
+                bid = pg.get("block_idx", -1)
+                if bid >= 0 and bid > block_idx and pg.get("is_att", False):
+                    pg["is_att"] = False
+                    if is_main():
+                        print(f"  Bumped block {bid} to full LR "
+                              f"(upstream PoM inserted at block {block_idx})")
+
+        if is_main():
+            total_trainable = sum(
+                p.numel() for g in optimizer.param_groups for p in g["params"]
+                if p.requires_grad
+            )
+            print(f"step={step}  phases_done={phases_done}/{len(ACTIVATION_ORDER)}"
+                  f"  trainable={total_trainable/1e6:.0f}M params  reason={reason}")
+
+        if phases_done == len(ACTIVATION_ORDER):
+            in_consolidation = True
             if is_main():
-                total_trainable = sum(
-                    p.numel() for g in optimizer.param_groups for p in g["params"]
-                    if p.requires_grad
-                )
-                print(f"step={step}  phases_done={phases_done}/{len(ACTIVATION_ORDER)}"
-                      f"  trainable={total_trainable/1e6:.0f}M params")
+                print(f"step={step}  All blocks activated → consolidation phase "
+                      f"(lr_scale={args.consolidation_lr_scale})")
 
-        # --- LR schedule ---
-        lr = lr_schedule(step, args.warmup_steps, args.max_steps, args.lr)
+    while step < args.max_steps:
+        # --- Progressive activation (adaptive: plateau or phase_steps cap) ---
+        if step > 0:
+            _try_advance_phase(step)
+
+        # --- LR schedule + per-block warmup + consolidation ---
+        base_lr = lr_schedule(step, args.warmup_steps, args.max_steps, args.lr)
         for pg in optimizer.param_groups:
-            scale = args.pretrained_lr_scale if pg.get("is_att", False) else 1.0
-            pg["lr"] = lr * scale
+            # Per-block warmup: ramp from 0 to target LR over block_warmup_steps.
+            local_step = step - pg.get("activated_at", 0)
+            warmup = min(1.0, local_step / max(1, args.block_warmup_steps))
+            if in_consolidation:
+                # Consolidation: uniform lr scale for everything.
+                pg["lr"] = base_lr * args.consolidation_lr_scale * warmup
+            else:
+                scale = args.pretrained_lr_scale if pg.get("is_att", False) else 1.0
+                pg["lr"] = base_lr * scale * warmup
 
         # --- Batch ---
         try:
@@ -626,6 +702,14 @@ def main():
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
+        # --- Update loss EMA and history (used for plateau detection) ---
+        loss_val = loss.item()
+        if loss_ema is None:
+            loss_ema = loss_val
+        else:
+            loss_ema = loss_ema_decay * loss_ema + (1 - loss_ema_decay) * loss_val
+        loss_history.append(loss_ema)
+
         # --- Logging ---
         if is_main() and step % args.log_every == 0:
             elapsed = time.time() - t0
@@ -636,17 +720,20 @@ def main():
             mid  = (t_cpu >= 334) & (t_cpu < 667)
             high = t_cpu >= 667
             log = {
-                "loss":        loss.item(),
-                "loss_low_t":  lp[low].mean().item()  if low.any()  else float("nan"),
-                "loss_mid_t":  lp[mid].mean().item()  if mid.any()  else float("nan"),
-                "loss_high_t": lp[high].mean().item() if high.any() else float("nan"),
-                "lr": lr,
-                "phases_done": phases_done,
-                "step": step,
+                "loss":           loss_val,
+                "loss_ema":       loss_ema,
+                "loss_low_t":     lp[low].mean().item()  if low.any()  else float("nan"),
+                "loss_mid_t":     lp[mid].mean().item()  if mid.any()  else float("nan"),
+                "loss_high_t":    lp[high].mean().item() if high.any() else float("nan"),
+                "lr":             base_lr,
+                "phases_done":    phases_done,
+                "in_consolidation": int(in_consolidation),
+                "steps_in_phase": step - last_phase_step,
+                "step":           step,
                 "samples_per_sec": sps,
             }
             wandb.log(log, step=step)
-            print(f"step={step:7d}  loss={log['loss']:.4f}  lr={lr:.2e}"
+            print(f"step={step:7d}  loss={loss_val:.4f}  ema={loss_ema:.4f}  lr={base_lr:.2e}"
                   f"  phases={phases_done}/{len(ACTIVATION_ORDER)}  {sps:.1f} samp/s")
 
         # --- Checkpointing ---
@@ -657,6 +744,7 @@ def main():
             if is_main():
                 state = json.loads((ckpt_dir / "train_state.json").read_text())
                 state["phases_done"] = phases_done
+                state["last_phase_step"] = last_phase_step
                 (ckpt_dir / "train_state.json").write_text(json.dumps(state))
                 print(f"Saved checkpoint to {ckpt_dir}")
             if dist.is_initialized():
@@ -682,6 +770,7 @@ def main():
             if is_main():
                 state = json.loads((ckpt_dir / "train_state.json").read_text())
                 state["phases_done"] = phases_done
+                state["last_phase_step"] = last_phase_step
                 (ckpt_dir / "train_state.json").write_text(json.dumps(state))
                 (out_dir / ".save_and_exit").unlink(missing_ok=True)
                 print(f"Wall-time signal — saved to {ckpt_dir}. Exiting.")

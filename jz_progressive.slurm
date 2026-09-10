@@ -64,6 +64,11 @@ srun torchrun \
         --pom_n_sel_heads 24 \
         --phase_steps 10000 \
         --pretrained_lr_scale 0.1 \
+        --block_warmup_steps 1000 \
+        --min_phase_steps 5000 \
+        --plateau_threshold 0.005 \
+        --plateau_window 2000 \
+        --consolidation_lr_scale 0.5 \
         --batch_size 32 \
         --grad_accum_steps 4 \
         --lr 1e-4 \
