@@ -62,6 +62,7 @@ srun torchrun \
         --pom_expand 2 \
         --pom_n_groups 1 \
         --pom_n_sel_heads 24 \
+        --pom_rope_max_seq_len 16384 \
         --phase_steps 10000 \
         --pretrained_lr_scale 0.1 \
         --block_warmup_steps 1000 \
@@ -82,6 +83,8 @@ srun torchrun \
         --val_every 10000 \
         --n_val_images 256 \
         --gradient_checkpointing \
+        --snr_gamma 5.0 \
+        --ema_decay 0.9999 \
         --num_sample_prompts 25 \
         --wandb_project pom-progressive \
         --wandb_offline &

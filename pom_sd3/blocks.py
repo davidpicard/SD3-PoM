@@ -291,12 +291,28 @@ class JointPoMBlock(nn.Module):
         n_txt = encoder_hidden_states.shape[1]
         dev = hidden_states.device
 
-        # 1-D RoPE positions: image tokens at 0..n_img-1 (row-major patch order),
-        # text tokens at n_img..n_img+n_txt-1 (no position overlap between modalities)
-        img_positions = torch.arange(n_img, device=dev, dtype=torch.int64)
+        # Factored 2D positions: row*stride + col, where stride > W-1 ensures
+        # column differences (≤ W-1) and row differences (multiples of stride)
+        # occupy separate frequency bands of the 1D RoPE kernel — approximating
+        # true 2D RoPE without needing a separate Triton kernel.
+        # Text tokens are placed just after the last image position.
+        # Falls back to row-major if the table is too small for this resolution.
+        W = int(math.isqrt(n_img))
+        max_seq_len = getattr(self.pom, 'max_seq_len', 8192)
+        # Largest stride s.t. (W-1)*stride+(W-1)+n_txt < max_seq_len AND stride ≥ W
+        max_stride = (max_seq_len - n_txt - W) // max(W - 1, 1)
+        if max_stride >= W:
+            stride = max_stride
+            idx = torch.arange(n_img, device=dev, dtype=torch.int64)
+            img_positions = (idx // W) * stride + (idx % W)
+            text_start = int((W - 1) * stride + (W - 1)) + 1
+        else:
+            # Resolution too large for factored positions; fall back to row-major
+            img_positions = torch.arange(n_img, device=dev, dtype=torch.int64)
+            text_start = n_img
         joint_positions = torch.cat([
             img_positions,
-            torch.arange(n_img, n_img + n_txt, device=dev, dtype=torch.int64),
+            torch.arange(text_start, text_start + n_txt, device=dev, dtype=torch.int64),
         ])
 
         # --- Normalize image tokens ---

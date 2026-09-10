@@ -284,6 +284,10 @@ def parse_args():
     p.add_argument("--n_val_images", type=int, default=256)
     p.add_argument("--num_sample_prompts", type=int, default=25)
     p.add_argument("--gradient_checkpointing", action="store_true")
+    p.add_argument("--snr_gamma", type=float, default=5.0,
+                   help="Min-SNR loss weighting gamma (0 = disabled)")
+    p.add_argument("--ema_decay", type=float, default=0.9999,
+                   help="EMA decay for model weights used in sampling/validation (0 = disabled)")
     p.add_argument("--wandb_project", default="sd3-pom-progressive")
     p.add_argument("--wandb_run_name", default=None)
     p.add_argument("--wandb_offline", action="store_true")
@@ -423,6 +427,45 @@ def main():
     # FSDP wrap — requires_grad=False params are not reduced (FSDP + use_orig_params=True)
     model = wrap_model_fsdp(model, local_rank, gpus_per_node=args.gpus_per_node)
     model.train()
+
+    # --- EMA shadow (fp32, per-rank shards match FSDP sharding) ---
+    # Updated after every optimizer step; used for sampling and validation.
+    ema_params = (
+        [p.data.clone().float() for p in model.parameters()]
+        if args.ema_decay > 0 else None
+    )
+
+    @contextlib.contextmanager
+    def _use_ema():
+        """Temporarily swap EMA weights into the model for inference."""
+        if ema_params is None:
+            yield
+            return
+        saved = [p.data.clone() for p in model.parameters()]
+        for ema_p, p in zip(ema_params, model.parameters()):
+            p.data.copy_(ema_p.to(p.dtype))
+        try:
+            yield
+        finally:
+            for sv, p in zip(saved, model.parameters()):
+                p.data.copy_(sv)
+
+    def _group_grad_norms() -> dict:
+        """Per optimizer-group gradient norms. All ranks participate (all-reduce)."""
+        sq_list = [
+            sum(
+                (p.grad.detach().float().pow(2).sum() for p in pg["params"] if p.grad is not None),
+                torch.tensor(0.0, device=device),
+            )
+            for pg in optimizer.param_groups
+        ]
+        sq_t = torch.stack(sq_list)
+        if dist.is_initialized():
+            dist.all_reduce(sq_t, op=dist.ReduceOp.SUM)
+        return {
+            pg.get("block_idx", -99): sq_t[i].item() ** 0.5
+            for i, pg in enumerate(optimizer.param_groups)
+        }
 
     # --- Optimizer (initially empty; blocks added as they're activated) ---
     # Overhead params are split into two groups:
@@ -565,8 +608,9 @@ def main():
         # Log samples just before activating the next block — clean baseline
         # uncontaminated by the freshly activated block (logged at step-1).
         model.eval()
-        generate_samples(model, vae, text_pipe, step - 1, device,
-                         args.num_sample_prompts, resolution=args.image_size)
+        with _use_ema():
+            generate_samples(model, vae, text_pipe, step - 1, device,
+                             args.num_sample_prompts, resolution=args.image_size)
         model.train()
 
         block_idx = ACTIVATION_ORDER[phases_done]
@@ -689,9 +733,18 @@ def main():
             ).sample
             v_target = (eps - x_0).to(v_pred.dtype)
             loss_per = F.mse_loss(v_pred, v_target, reduction="none").mean(dim=(1, 2, 3))
-            loss = loss_per.mean()
+            # Min-SNR loss weighting: down-weights very-low-noise timesteps
+            # (σ≪1, SNR→∞) which otherwise dominate and slow convergence.
+            # SNR = (1-σ)²/σ²; weight = min(SNR, γ)/SNR ∈ (0,1].
+            if args.snr_gamma > 0:
+                snr = (1.0 - sigma.view(B)) ** 2 / (sigma.view(B) ** 2).clamp(min=1e-6)
+                snr_weight = (snr.clamp(max=args.snr_gamma) / snr).to(loss_per.dtype)
+                loss = (loss_per * snr_weight).mean()
+            else:
+                loss = loss_per.mean()
             (loss / args.grad_accum_steps).backward()
 
+        _block_gnorms: dict | None = None
         if is_last_accum:
             if isinstance(model, FSDP):
                 model.clip_grad_norm_(1.0)
@@ -699,8 +752,16 @@ def main():
                 torch.nn.utils.clip_grad_norm_(
                     [p for g in optimizer.param_groups for p in g["params"]], 1.0
                 )
+            # Capture per-block grad norms before zero_grad (all ranks participate)
+            if step % args.log_every == 0:
+                _block_gnorms = _group_grad_norms()
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+            # EMA update: lerp each shard toward the current weights
+            if ema_params is not None:
+                with torch.no_grad():
+                    for ema_p, p in zip(ema_params, model.parameters()):
+                        ema_p.lerp_(p.data.float(), 1.0 - args.ema_decay)
 
         # --- Update loss EMA and history (used for plateau detection) ---
         loss_val = loss.item()
@@ -740,6 +801,12 @@ def main():
                 "step":           step,
                 "samples_per_sec": sps,
             }
+            if _block_gnorms is not None:
+                for bid, gnorm in _block_gnorms.items():
+                    key = "grad_norm/output" if bid == -2 else \
+                          "grad_norm/input"  if bid == -1 else \
+                          f"grad_norm/block_{bid:02d}"
+                    log[key] = gnorm
             wandb.log(log, step=step)
             print(f"step={step:7d}  loss={loss_val:.4f}  ema={loss_ema:.4f}  lr={base_lr:.2e}"
                   f"  phases={phases_done}/{len(ACTIVATION_ORDER)}  {sps:.1f} samp/s")
@@ -760,13 +827,15 @@ def main():
 
         # --- Validation ---
         if step > 0 and args.val_every > 0 and step % args.val_every == 0 and not args.smoke_test:
-            run_validation(model, val_cache, step, device)
+            with _use_ema():
+                run_validation(model, val_cache, step, device)
 
         # --- Sample generation ---
         if step > 0 and step % args.sample_every == 0 and not args.smoke_test:
             model.eval()
-            generate_samples(model, vae, text_pipe, step, device,
-                             args.num_sample_prompts, resolution=args.image_size)
+            with _use_ema():
+                generate_samples(model, vae, text_pipe, step, device,
+                                 args.num_sample_prompts, resolution=args.image_size)
             model.train()
 
         step += 1
