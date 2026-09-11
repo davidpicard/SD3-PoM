@@ -824,14 +824,15 @@ def main():
                           "grad_norm/input"  if bid == -1 else \
                           f"grad_norm/block_{bid:02d}"
                     log[key] = gnorm
-            _inner = getattr(model, '_fsdp_wrapped_module', model)
-            for i, blk in enumerate(_inner.transformer_blocks):
-                hs = getattr(getattr(blk, 'pom', None), 'h_scale', None)
-                if hs is not None:
-                    log[f"h_scale/block_{i:02d}"] = wandb.Histogram(hs.detach().float().cpu().numpy())
-                hs2 = getattr(getattr(blk, 'pom2', None), 'h_scale', None)
-                if hs2 is not None:
-                    log[f"h_scale2/block_{i:02d}"] = wandb.Histogram(hs2.detach().float().cpu().numpy())
+            with FSDP.summon_full_params(model, writeback=False, rank0_only=True):
+                _inner = getattr(model, '_fsdp_wrapped_module', model)
+                for i, blk in enumerate(_inner.transformer_blocks):
+                    hs = getattr(getattr(blk, 'pom', None), 'h_scale', None)
+                    if hs is not None:
+                        log[f"h_scale/block_{i:02d}"] = wandb.Histogram(hs.detach().float().cpu().numpy())
+                    hs2 = getattr(getattr(blk, 'pom2', None), 'h_scale', None)
+                    if hs2 is not None:
+                        log[f"h_scale2/block_{i:02d}"] = wandb.Histogram(hs2.detach().float().cpu().numpy())
             wandb.log(log, step=step)
             print(f"step={step:7d}  loss={loss_val:.4f}  ema={loss_ema:.4f}  lr={base_lr:.2e}"
                   f"  phases={phases_done}/{len(ACTIVATION_ORDER)}  {sps:.1f} samp/s")
