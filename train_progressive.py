@@ -836,12 +836,17 @@ def main():
                     _inner = getattr(model, '_fsdp_wrapped_module', model)
                     hscale_log = {}
                     for i, blk in enumerate(_inner.transformer_blocks):
-                        hs = getattr(getattr(blk, 'pom', None), 'h_scale', None)
-                        if hs is not None:
-                            hscale_log[f"h_scale/block_{i:02d}"] = wandb.Histogram(hs.detach().float().cpu().numpy())
-                        hs2 = getattr(getattr(blk, 'pom2', None), 'h_scale', None)
-                        if hs2 is not None:
-                            hscale_log[f"h_scale2/block_{i:02d}"] = wandb.Histogram(hs2.detach().float().cpu().numpy())
+                        for attr, prefix in (('pom', 'h_scale'), ('pom2', 'h_scale2')):
+                            hs = getattr(getattr(blk, attr, None), 'h_scale', None)
+                            if hs is None:
+                                continue
+                            v = hs.detach().float().cpu()
+                            p = torch.quantile(v, torch.tensor([0.1, 0.5, 0.9]))
+                            hscale_log[f"{prefix}/block_{i:02d}/mean"] = v.mean().item()
+                            hscale_log[f"{prefix}/block_{i:02d}/std"]  = v.std().item()
+                            hscale_log[f"{prefix}/block_{i:02d}/p10"]  = p[0].item()
+                            hscale_log[f"{prefix}/block_{i:02d}/p50"]  = p[1].item()
+                            hscale_log[f"{prefix}/block_{i:02d}/p90"]  = p[2].item()
                     wandb.log(hscale_log, step=step)
 
         # --- Checkpointing ---
